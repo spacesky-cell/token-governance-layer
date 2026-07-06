@@ -1,0 +1,14 @@
+.claude/
+.mcp.json
+.pytest_cache/
+.tgl/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.log
+*.jsonl
+*.tgz
+node_modules/
+dist/
+build/
+*.egg-info/

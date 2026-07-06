@@ -1,0 +1,40 @@
+{
+  "name": "token-governance-layer",
+  "version": "0.1.0",
+  "description": "Local-first token governance layer for coding agents.",
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "type": "commonjs",
+  "bin": {
+    "token-governance-layer": "bin/tgl.js",
+    "tgl": "bin/tgl.js",
+    "tgl-mcp": "bin/tgl-mcp.js",
+    "tgl-mcp-gateway": "bin/tgl-mcp-gateway.js",
+    "tgl-claude-hook": "bin/tgl-claude-hook.js"
+  },
+  "files": [
+    "bin",
+    "src/token_governance/*.py",
+    "pyproject.toml",
+    "LICENSE",
+    "README.md",
+    "token-governance.config.example.json",
+    "token-governance-layer-overall-plan.zh.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "python -m pytest -q",
+    "pack:check": "npm pack --dry-run"
+  },
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "token",
+    "llm",
+    "agent"
+  ]
+}

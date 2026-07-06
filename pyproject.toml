@@ -1,0 +1,20 @@
+[project]
+name = "token-governance-layer"
+version = "0.1.0"
+description = "Local-first token governance layer for coding agents."
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Token Governance Layer Contributors" }]
+dependencies = []
+
+[project.scripts]
+tgl = "token_governance.cli:main"
+tgl-mcp = "token_governance.mcp_server:main"
+tgl-mcp-gateway = "token_governance.mcp_gateway:main"
+tgl-claude-hook = "token_governance.claude_hook:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"

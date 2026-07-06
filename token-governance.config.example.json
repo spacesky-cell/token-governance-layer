@@ -1,0 +1,70 @@
+{
+  "ledger": {
+    "path": ".tgl/ledger.sqlite",
+    "retention_days": 30
+  },
+  "policy": {
+    "default": "default-conservative",
+    "min_tokens_for_compression": 80,
+    "protected_content_types": [
+      "user_instruction",
+      "secret",
+      "security"
+    ],
+    "protected_line_markers": [
+      "error",
+      "exception",
+      "failed",
+      "assert",
+      "traceback",
+      ".py:",
+      ".ts:",
+      ".tsx:",
+      ".js:",
+      ".rs:",
+      ".go:"
+    ]
+  },
+  "mcp": {
+    "server_name": "token-governance-layer",
+    "tools": [
+      "govern_context",
+      "retrieve_original",
+      "explain_receipt",
+      "show_savings",
+      "list_context_risks"
+    ]
+  },
+  "gateway": {
+    "server_name": "token-governance-gateway",
+    "tool_policy": {
+      "allow": [],
+      "deny": []
+    },
+    "backends": [
+      {
+        "name": "code",
+        "command": "python",
+        "args": [
+          "./path/to/code_mcp_server.py"
+        ]
+      },
+      {
+        "name": "docs",
+        "command": "python",
+        "args": [
+          "./path/to/docs_mcp_server.py"
+        ]
+      }
+    ],
+    "tools": [
+      "list_backend_tools",
+      "get_tool_schema",
+      "invoke_tool",
+      "retrieve_original",
+      "explain_receipt",
+      "show_savings",
+      "list_context_risks"
+    ]
+  }
+}

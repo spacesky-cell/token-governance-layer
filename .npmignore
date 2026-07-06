@@ -1,0 +1,10 @@
+.claude
+.mcp.json
+.pytest_cache
+.tgl
+tests
+__pycache__
+*.sqlite
+*.log
+*.jsonl
+*.tgz
