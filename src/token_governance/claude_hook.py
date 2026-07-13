@@ -36,11 +36,23 @@ def build_hook_response(payload: dict[str, Any], *, ledger: ContextLedger) -> di
     if payload.get("hook_event_name") != "PostToolUse":
         return {"continue": True}
 
-    output = _extract_tool_output(payload)
+    tool_name = str(payload.get("tool_name", "unknown"))
+    normalized_tool_name = tool_name.lower()
+    if normalized_tool_name == "powershell":
+        return {"continue": True}
+    if normalized_tool_name == "bash":
+        original = payload.get("tool_response", payload.get("tool_output"))
+        if not isinstance(original, dict):
+            return {"continue": True}
+        stdout = original.get("stdout")
+        if not isinstance(stdout, str) or not stdout:
+            return {"continue": True}
+        output = stdout
+    else:
+        output = _extract_tool_output(payload)
     if not output:
         return {"continue": True}
 
-    tool_name = str(payload.get("tool_name", "unknown"))
     engine = GovernanceEngine(ledger=ledger, policy=PolicyEngine())
     result = engine.govern_context(
         output,
@@ -55,7 +67,7 @@ def build_hook_response(payload: dict[str, Any], *, ledger: ContextLedger) -> di
         "continue": True,
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "updatedToolOutput": _format_updated_output(result),
+            "updatedToolOutput": _format_updated_tool_output(payload, result),
         },
     }
 
@@ -101,6 +113,20 @@ def _format_updated_output(result: dict[str, Any]) -> str:
             "restore: call retrieve_original with this receipt_id if full output is needed.",
         ]
     )
+
+
+def _format_updated_tool_output(payload: dict[str, Any], result: dict[str, Any]) -> Any:
+    formatted = _format_updated_output(result)
+    original = payload.get("tool_response", payload.get("tool_output"))
+    tool_name = str(payload.get("tool_name", "")).lower()
+    if tool_name == "bash" and isinstance(original, dict):
+        return {
+            "stdout": formatted,
+            "stderr": str(original.get("stderr", "")),
+            "interrupted": bool(original.get("interrupted", False)),
+            "isImage": bool(original.get("isImage", False)),
+        }
+    return formatted
 
 
 if __name__ == "__main__":

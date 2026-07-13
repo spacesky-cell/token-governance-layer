@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-13",
+  "result": "pass",
+  "claude_code_version": "2.1.206",
+  "session_sha256": "d4166494db3300232c0923300ffcdbe6f25d73f9bdb95262882db94b986258d3",
+  "stream_sha256": "13a67b307763df10c7a3d0746e918095fbcfad85f290751862316fc96de5d3c8",
+  "temporary_tarball_sha256": "58f893d075d74a0c75d13ac125db44a2ec887916b88e2e37d15e66b12462923a",
+  "receipt_id_sha256": "bfbbde7a855c367194894e305b00afcc15bfc6104f86d0d9acf878ea97e3caea",
+  "original_sha256": "7c01e13bef7c87e06646806f954cc8d0026d21a8798647acb40248ae4f6c56bb",
+  "sentinel_length": 45,
+  "restored_length": 4091,
+  "redacted_observation": {
+    "hook_response": {
+      "updated_tool_output_type": "object",
+      "updated_tool_output_keys": [
+        "stdout",
+        "stderr",
+        "interrupted",
+        "isImage"
+      ],
+      "stdout_fragment": "[Token Governance Summary]\n...\n[Token Governance Receipt]\nreceipt_id: <redacted>",
+      "stderr": "",
+      "interrupted": false,
+      "isImage": false
+    },
+    "model_visible_tool_result": {
+      "content_type": "string",
+      "content_fragment": "[Token Governance Summary]\n...\n[Token Governance Receipt]\nreceipt_id: <redacted>",
+      "contains_runtime_sentinel": false
+    },
+    "restore": {
+      "contains_runtime_sentinel": true,
+      "sha256_matches_ledger_original_hash": true
+    }
+  },
+  "assertions": {
+    "hook_shape_is_object": true,
+    "hook_stdout_has_receipt": true,
+    "tool_result_has_receipt": true,
+    "tool_result_has_receipt_id": true,
+    "tool_result_excludes_sentinel": true,
+    "restored_contains_sentinel": true,
+    "temporary_artifacts_cleaned": true,
+    "temporary_processes_cleaned": true,
+    "tls_bypass_removed_for_successful_call": true
+  }
+}

@@ -19,7 +19,12 @@ def test_post_tool_use_replaces_long_tool_output_with_governed_output(tmp_path):
     payload = {
         "hook_event_name": "PostToolUse",
         "tool_name": "Bash",
-        "tool_output": "\n".join(f"INFO repeated build line {i % 4}" for i in range(120)),
+        "tool_response": {
+            "stdout": "\n".join(f"INFO repeated build line {i % 4}" for i in range(120)),
+            "stderr": "",
+            "interrupted": False,
+            "isImage": False,
+        },
     }
 
     response = build_hook_response(payload, ledger=ContextLedger(db_path))
@@ -28,8 +33,8 @@ def test_post_tool_use_replaces_long_tool_output_with_governed_output(tmp_path):
     hook_output = response["hookSpecificOutput"]
     assert hook_output["hookEventName"] == "PostToolUse"
     assert "updatedToolOutput" in hook_output
-    assert "Token Governance Summary" in hook_output["updatedToolOutput"]
-    assert "receipt_id:" in hook_output["updatedToolOutput"]
+    assert "Token Governance Summary" in hook_output["updatedToolOutput"]["stdout"]
+    assert "receipt_id:" in hook_output["updatedToolOutput"]["stdout"]
 
 
 def test_post_tool_use_passthrough_when_governance_does_not_save_tokens(tmp_path):
@@ -59,7 +64,7 @@ def test_post_tool_use_accepts_tool_response_alias(tmp_path):
     assert response["hookSpecificOutput"]["updatedToolOutput"]
 
 
-def test_post_tool_use_extracts_stdout_from_tool_response_object(tmp_path):
+def test_post_tool_use_fails_open_for_unverified_powershell_shape(tmp_path):
     db_path = tmp_path / "hook.sqlite"
     payload = {
         "hook_event_name": "PostToolUse",
@@ -73,9 +78,64 @@ def test_post_tool_use_extracts_stdout_from_tool_response_object(tmp_path):
 
     response = build_hook_response(payload, ledger=ContextLedger(db_path))
 
+    assert response == {"continue": True}
+    assert ContextLedger(db_path).savings()["receipt_count"] == 0
+
+
+def test_post_tool_use_fails_open_for_string_shaped_bash_output(tmp_path):
+    db_path = tmp_path / "hook.sqlite"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_output": "\n".join("repeated build output" for _ in range(180)),
+    }
+
+    response = build_hook_response(payload, ledger=ContextLedger(db_path))
+
+    assert response == {"continue": True}
+    assert ContextLedger(db_path).savings()["receipt_count"] == 0
+
+
+def test_post_tool_use_fails_open_for_stderr_only_bash_output(tmp_path):
+    db_path = tmp_path / "hook.sqlite"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_response": {
+            "stdout": "",
+            "stderr": "\n".join("repeated error output" for _ in range(180)),
+            "interrupted": False,
+            "isImage": False,
+        },
+    }
+
+    response = build_hook_response(payload, ledger=ContextLedger(db_path))
+
+    assert response == {"continue": True}
+    assert ContextLedger(db_path).savings()["receipt_count"] == 0
+
+
+def test_post_tool_use_preserves_bash_output_shape(tmp_path):
+    db_path = tmp_path / "hook.sqlite"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_response": {
+            "stdout": "\n".join("repeated build output" for _ in range(180)),
+            "stderr": "warning from the command",
+            "interrupted": False,
+            "isImage": False,
+        },
+    }
+
+    response = build_hook_response(payload, ledger=ContextLedger(db_path))
+
     updated = response["hookSpecificOutput"]["updatedToolOutput"]
-    assert "Token Governance Summary" in updated
-    assert "receipt_id:" in updated
+    assert "Token Governance Summary" in updated["stdout"]
+    assert "receipt_id:" in updated["stdout"]
+    assert updated["stderr"] == "warning from the command"
+    assert updated["interrupted"] is False
+    assert updated["isImage"] is False
 
 
 def test_non_post_tool_use_event_is_ignored(tmp_path):
@@ -96,7 +156,12 @@ def test_claude_hook_cli_reads_json_from_stdin(tmp_path):
     payload = {
         "hook_event_name": "PostToolUse",
         "tool_name": "Bash",
-        "tool_output": "\n".join(f"INFO repeated test line {i % 2}" for i in range(100)),
+        "tool_response": {
+            "stdout": "\n".join(f"INFO repeated test line {i % 2}" for i in range(100)),
+            "stderr": "",
+            "interrupted": False,
+            "isImage": False,
+        },
     }
 
     proc = subprocess.run(
