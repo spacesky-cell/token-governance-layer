@@ -186,6 +186,46 @@ def test_global_command_discovery_rejects_noop_windows_shims(tmp_path, monkeypat
         discover_stable_commands({"TGL_NPM_WRAPPER": "1", "PATH": str(prefix)})
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows npm shim validation")
+def test_global_command_discovery_rejects_missing_manifest_bin_target(
+    tmp_path, monkeypatch
+):
+    prefix = tmp_path / "global"
+    package_root = prefix / "node_modules" / "token-governance-layer"
+    (package_root / "bin").mkdir(parents=True)
+    (package_root / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "token-governance-layer",
+                "bin": {
+                    "tgl-claude-hook": "bin/tgl-claude-hook.js",
+                    "tgl-mcp": "bin/tgl-mcp.js",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    hook = prefix / "tgl-claude-hook.CMD"
+    mcp = prefix / "tgl-mcp.CMD"
+    hook.write_text(
+        '@echo off\nnode "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        encoding="utf-8",
+    )
+    mcp.write_text(
+        '@echo off\nnode "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-mcp.js" %*\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer_module, "PACKAGE_ROOT", package_root)
+    monkeypatch.setattr(
+        installer_module.shutil,
+        "which",
+        lambda name, path=None: str(hook if name == "tgl-claude-hook" else mcp),
+    )
+
+    with pytest.raises(InstallError, match="npm install -g"):
+        discover_stable_commands({"TGL_NPM_WRAPPER": "1", "PATH": str(prefix)})
+
+
 def test_global_command_discovery_rejects_manifest_with_unowned_bin_mapping(
     tmp_path, monkeypatch
 ):
@@ -488,6 +528,52 @@ def test_uninstall_removes_only_exact_owned_entries_and_preserves_config_ledger(
     assert "token-governance-layer" not in read_json(project / ".mcp.json")[
         "mcpServers"
     ]
+
+
+def test_uninstall_without_ownership_disables_hook_and_preserves_entries(tmp_path):
+    project = tmp_path / "project"
+    commands = stable_commands(tmp_path)
+    install_project(project, commands=commands)
+    ownership = project / ".tgl" / "install-ownership.json"
+    ownership.unlink()
+    ledger = project / ".tgl" / "ledger.sqlite"
+    ledger.write_bytes(b"preserve ledger")
+    settings_before = (project / ".claude" / "settings.json").read_bytes()
+    mcp_before = (project / ".mcp.json").read_bytes()
+    config_before = (project / "token-governance.config.json").read_bytes()
+
+    with pytest.raises(
+        InstallError,
+        match="entries were preserved.*claude-install --repair",
+    ):
+        uninstall_project(project)
+
+    assert not (project / ".tgl" / "install-state.json").exists()
+    assert (project / ".claude" / "settings.json").read_bytes() == settings_before
+    assert (project / ".mcp.json").read_bytes() == mcp_before
+    assert (project / "token-governance.config.json").read_bytes() == config_before
+    assert ledger.read_bytes() == b"preserve ledger"
+
+
+def test_repair_reconstructs_missing_ownership_for_exact_installed_commands(tmp_path):
+    project = tmp_path / "project"
+    commands = stable_commands(tmp_path)
+    install_project(project, commands=commands)
+    ownership = project / ".tgl" / "install-ownership.json"
+    ownership.unlink()
+
+    report = install_project(project, commands=commands, repair=True)
+
+    assert report["ok"] is True
+    assert read_json(ownership) == {
+        "schema_version": 1,
+        "hook_command": str(commands.hook).replace("\\", "/"),
+        "mcp_command": str(commands.mcp).replace("\\", "/"),
+    }
+    assert read_json(project / ".tgl" / "install-state.json") == {
+        "schema_version": 1,
+        "status": "complete",
+    }
 
 
 @pytest.mark.parametrize(

@@ -177,6 +177,7 @@ def discover_stable_commands(
             expected_script = PACKAGE_ROOT / "bin" / script_name
             if (
                 _same_path(expected_root, PACKAGE_ROOT) is False
+                or not expected_script.is_file()
                 or not _windows_shim_targets_script(command, expected_script)
             ):
                 raise InstallError(GLOBAL_INSTALL_GUIDANCE)
@@ -246,6 +247,27 @@ def install_project(
         _validate_config(paths["config"])
 
     server = _mcp_server(mcp_config)
+    managed_hook_executables = _managed_hook_executables(
+        settings,
+        paths["config"],
+        paths["state"],
+    )
+    if repair and recorded_commands is None and (
+        server is not None or managed_hook_executables
+    ):
+        mcp_matches = (
+            server is not None
+            and _is_owned_mcp(server, paths["config"], commands.mcp)
+        )
+        hook_matches = (
+            len(managed_hook_executables) == 1
+            and _same_path(managed_hook_executables[0], commands.hook)
+        )
+        if not mcp_matches or not hook_matches:
+            raise InstallError(
+                "Existing managed-argument entries are not owned by the proven commands"
+            )
+        recorded_commands = _OwnershipRecord(hook=commands.hook, mcp=commands.mcp)
     if server is not None and (
         recorded_commands is None
         or not _is_owned_mcp(
@@ -338,6 +360,26 @@ def uninstall_project(
     ownership = _read_optional_json(paths["ownership"])
     recorded_commands = _parse_ownership(ownership)
     changed = False
+
+    if recorded_commands is None:
+        server = _mcp_server(mcp_config)
+        has_unproven_entries = (
+            isinstance(server, dict)
+            and _is_managed_mcp(server, paths["config"])
+        ) or bool(
+            _managed_hook_executables(
+                settings,
+                paths["config"],
+                paths["state"],
+            )
+        )
+        if paths["state"].exists() or has_unproven_entries:
+            file_store.remove(paths["state"], stage="state")
+            raise InstallError(
+                "TGL ownership registry is missing; Hook/MCP entries were preserved "
+                "because ownership cannot be proven. Run claude-install --repair "
+                "from the proven global install"
+            )
 
     updated_settings, hook_removed = (
         _without_owned_hooks(
@@ -614,11 +656,17 @@ def _is_owned_mcp(
     server: dict[str, Any], config_path: Path, executable: Path
 ) -> bool:
     return (
-        server.get("type") == "stdio"
-        and server.get("args") == ["--config", _normalized_path(config_path)]
+        _is_managed_mcp(server, config_path)
         and isinstance(server.get("command"), str)
         and _same_path(Path(server["command"]), executable)
     )
+
+
+def _is_managed_mcp(server: dict[str, Any], config_path: Path) -> bool:
+    return server.get("type") == "stdio" and server.get("args") == [
+        "--config",
+        _normalized_path(config_path),
+    ]
 
 
 def _set_hook(
@@ -701,23 +749,64 @@ def _is_owned_hook_command(
     state_path: Path,
     executable: Path,
 ) -> bool:
+    managed_executable = _managed_hook_executable(
+        command,
+        config_path,
+        state_path,
+    )
+    return managed_executable is not None and _same_path(
+        managed_executable,
+        executable,
+    )
+
+
+def _managed_hook_executable(
+    command: Any,
+    config_path: Path,
+    state_path: Path,
+) -> Path | None:
     if not isinstance(command, str):
-        return False
+        return None
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
-        return False
+        return None
     tokens = [token.replace("\\$", "$").replace("\\`", "`") for token in tokens]
     if len(tokens) != 5:
-        return False
+        return None
     command_executable, config_flag, config_value, state_flag, state_value = tokens
-    return (
-        _same_path(Path(command_executable), executable)
-        and config_flag == "--config"
-        and _same_path(Path(config_value), config_path)
-        and state_flag == "--install-state"
-        and _same_path(Path(state_value), state_path)
-    )
+    if (
+        not Path(command_executable).is_absolute()
+        or config_flag != "--config"
+        or not _same_path(Path(config_value), config_path)
+        or state_flag != "--install-state"
+        or not _same_path(Path(state_value), state_path)
+    ):
+        return None
+    return Path(command_executable)
+
+
+def _managed_hook_executables(
+    settings: dict[str, Any],
+    config_path: Path,
+    state_path: Path,
+) -> list[Path]:
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    entries = hooks.get("PostToolUse")
+    if not isinstance(entries, list):
+        return []
+    executables = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            continue
+        for hook in entry["hooks"]:
+            command = hook.get("command") if isinstance(hook, dict) else None
+            executable = _managed_hook_executable(command, config_path, state_path)
+            if executable is not None:
+                executables.append(executable)
+    return executables
 
 
 def _has_owned_hook(

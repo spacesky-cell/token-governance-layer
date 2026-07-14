@@ -359,3 +359,26 @@ def test_cli_incomplete_install_requires_explicit_repair(tmp_path):
 
     assert repaired.returncode == 0, repaired.stderr
     assert json.loads(state.read_text(encoding="utf-8"))["status"] == "complete"
+
+
+def test_cli_uninstall_without_ownership_fails_open_with_actionable_repair(tmp_path):
+    project = tmp_path / "project"
+    env = fake_global_install_env(tmp_path)
+    installed = run_cli(
+        ["claude-install", "--project", str(project)], env_overrides=env
+    )
+    assert installed.returncode == 0, installed.stderr
+    (project / ".tgl" / "install-ownership.json").unlink()
+    settings_before = (project / ".claude" / "settings.json").read_bytes()
+    mcp_before = (project / ".mcp.json").read_bytes()
+
+    removed = run_cli(
+        ["claude-uninstall", "--project", str(project)], env_overrides=env
+    )
+
+    assert removed.returncode == 2
+    assert "entries were preserved" in removed.stderr
+    assert "claude-install --repair" in removed.stderr
+    assert not (project / ".tgl" / "install-state.json").exists()
+    assert (project / ".claude" / "settings.json").read_bytes() == settings_before
+    assert (project / ".mcp.json").read_bytes() == mcp_before
