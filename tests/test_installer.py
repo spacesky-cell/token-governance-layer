@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import sys
 
 import pytest
 
@@ -20,10 +21,29 @@ from token_governance import installer as installer_module
 def stable_commands(tmp_path):
     bin_dir = tmp_path / "全局 bin with spaces"
     bin_dir.mkdir()
-    hook = bin_dir / "tgl-claude-hook"
-    mcp = bin_dir / "tgl-mcp"
-    hook.write_text("hook", encoding="utf-8")
-    mcp.write_text("mcp", encoding="utf-8")
+    suffix = ".CMD" if os.name == "nt" else ""
+    hook = bin_dir / f"tgl-claude-hook{suffix}"
+    mcp = bin_dir / f"tgl-mcp{suffix}"
+    if os.name == "nt":
+        hook.write_text(
+            f'@"{sys.executable}" -m token_governance.claude_hook %*\n',
+            encoding="utf-8",
+        )
+        mcp.write_text(
+            f'@"{sys.executable}" -m token_governance.mcp_server %*\n',
+            encoding="utf-8",
+        )
+    else:
+        hook.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" -m token_governance.claude_hook "$@"\n',
+            encoding="utf-8",
+        )
+        mcp.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" -m token_governance.mcp_server "$@"\n',
+            encoding="utf-8",
+        )
+        hook.chmod(0o700)
+        mcp.chmod(0o700)
     return StableCommands(hook=hook.resolve(), mcp=mcp.resolve())
 
 
@@ -105,8 +125,14 @@ def test_global_command_discovery_proves_package_owned_absolute_shims(
         target.write_text("#!/usr/bin/env node\n", encoding="utf-8")
     hook.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
-        hook.write_text("@echo off\n", encoding="utf-8")
-        mcp.write_text("@echo off\n", encoding="utf-8")
+        hook.write_text(
+            '@echo off\nnode "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+            encoding="utf-8",
+        )
+        mcp.write_text(
+            '@echo off\nnode "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-mcp.js" %*\n',
+            encoding="utf-8",
+        )
     else:
         hook.symlink_to(targets["tgl-claude-hook"])
         mcp.symlink_to(targets["tgl-mcp"])
@@ -124,6 +150,40 @@ def test_global_command_discovery_proves_package_owned_absolute_shims(
     )
 
     assert commands == StableCommands(hook=hook.absolute(), mcp=mcp.absolute())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows npm shim validation")
+def test_global_command_discovery_rejects_noop_windows_shims(tmp_path, monkeypatch):
+    prefix = tmp_path / "global"
+    package_root = prefix / "node_modules" / "token-governance-layer"
+    (package_root / "bin").mkdir(parents=True)
+    (package_root / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "token-governance-layer",
+                "bin": {
+                    "tgl-claude-hook": "bin/tgl-claude-hook.js",
+                    "tgl-mcp": "bin/tgl-mcp.js",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    for script in ("tgl-claude-hook.js", "tgl-mcp.js"):
+        (package_root / "bin" / script).write_text("script", encoding="utf-8")
+    hook = prefix / "tgl-claude-hook.CMD"
+    mcp = prefix / "tgl-mcp.CMD"
+    hook.write_text("@echo off\n", encoding="utf-8")
+    mcp.write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr(installer_module, "PACKAGE_ROOT", package_root)
+    monkeypatch.setattr(
+        installer_module.shutil,
+        "which",
+        lambda name, path=None: str(hook if name == "tgl-claude-hook" else mcp),
+    )
+
+    with pytest.raises(InstallError, match="npm install -g"):
+        discover_stable_commands({"TGL_NPM_WRAPPER": "1", "PATH": str(prefix)})
 
 
 def test_global_command_discovery_rejects_manifest_with_unowned_bin_mapping(
@@ -227,6 +287,8 @@ def test_install_order_preserves_unrelated_entries_and_writes_exact_complete_sta
     assert checkpoints == [
         "config:write",
         "config:replace",
+        "ownership:write",
+        "ownership:replace",
         "mcp:write",
         "mcp:replace",
         "hook:write",
@@ -237,6 +299,11 @@ def test_install_order_preserves_unrelated_entries_and_writes_exact_complete_sta
     assert read_json(project / ".tgl" / "install-state.json") == {
         "schema_version": 1,
         "status": "complete",
+    }
+    assert read_json(project / ".tgl" / "install-ownership.json") == {
+        "schema_version": 1,
+        "hook_command": str(commands.hook).replace("\\", "/"),
+        "mcp_command": str(commands.mcp).replace("\\", "/"),
     }
     settings = read_json(settings_path)
     assert settings["theme"] == "keep"
@@ -280,6 +347,8 @@ def test_complete_install_is_byte_idempotent(tmp_path):
     [
         "config:write",
         "config:replace",
+        "ownership:write",
+        "ownership:replace",
         "mcp:write",
         "mcp:replace",
         "hook:write",
@@ -317,7 +386,8 @@ def test_install_failure_at_every_atomic_boundary_is_fail_open_and_repairable(
     has_owned_hook = (project / ".claude" / "settings.json").exists() and any(
         "--install-state" in command for command in owned_hook_commands(project)
     )
-    if has_owned_mcp or has_owned_hook:
+    has_registry = (project / ".tgl" / "install-ownership.json").exists()
+    if has_registry or has_owned_mcp or has_owned_hook:
         with pytest.raises(InstallError, match="--repair"):
             install_project(project, commands=commands)
         install_project(project, commands=commands, repair=True)
@@ -341,6 +411,23 @@ def test_incomplete_owned_state_requires_explicit_repair(tmp_path):
     assert project_snapshot(project) == before
     install_project(project, commands=commands, repair=True)
     assert read_json(project / ".tgl" / "install-state.json")["status"] == "complete"
+
+
+def test_explicit_repair_recovers_from_malformed_state_without_echoing_it(tmp_path):
+    project = tmp_path / "project"
+    commands = stable_commands(tmp_path)
+    install_project(project, commands=commands)
+    state = project / ".tgl" / "install-state.json"
+    state.write_bytes(b"{malformed private state")
+    before = project_snapshot(project)
+
+    diagnosed = doctor_project(project, integration=False)
+
+    assert diagnosed["ok"] is False
+    assert project_snapshot(project) == before
+    repaired = install_project(project, commands=commands, repair=True)
+    assert repaired["ok"] is True
+    assert read_json(state) == {"schema_version": 1, "status": "complete"}
 
 
 def test_install_refuses_unowned_server_name_conflict_without_mutation(tmp_path):
@@ -394,6 +481,7 @@ def test_uninstall_removes_only_exact_owned_entries_and_preserves_config_ledger(
     assert config_path.exists()
     assert ledger_path.read_bytes() == b"ledger stays"
     assert not (project / ".tgl" / "install-state.json").exists()
+    assert not (project / ".tgl" / "install-ownership.json").exists()
     assert owned_hook_commands(project) == [
         "echo tgl-claude-hook --install-state not-owned"
     ]
@@ -410,6 +498,7 @@ def test_uninstall_removes_only_exact_owned_entries_and_preserves_config_ledger(
         "mcp:write",
         "mcp:replace",
         "state:remove",
+        "ownership:remove",
     ],
 )
 def test_uninstall_failure_at_every_boundary_is_recoverable(tmp_path, failure_point):
@@ -434,6 +523,7 @@ def test_uninstall_failure_at_every_boundary_is_recoverable(tmp_path, failure_po
     assert (project / "token-governance.config.json").read_bytes() == config_before
     assert ledger.read_bytes() == b"preserve"
     assert not (project / ".tgl" / "install-state.json").exists()
+    assert not (project / ".tgl" / "install-ownership.json").exists()
     assert not any("--install-state" in command for command in owned_hook_commands(project))
     assert "token-governance-layer" not in read_json(project / ".mcp.json")[
         "mcpServers"
@@ -452,6 +542,59 @@ def test_uninstall_is_byte_idempotent_when_no_owned_entries_exist(tmp_path):
     report = uninstall_project(project)
 
     assert report["changed"] is False
+    assert project_snapshot(project) == before
+
+
+def test_uninstall_preserves_custom_executables_borrowing_managed_arguments(tmp_path):
+    project = tmp_path / "project"
+    commands = stable_commands(tmp_path)
+    install_project(project, commands=commands)
+    custom = tmp_path / "custom absolute command.exe"
+    custom.write_text("custom", encoding="utf-8")
+    settings_path = project / ".claude" / "settings.json"
+    settings = read_json(settings_path)
+    owned_command = owned_hook_commands(project)[0]
+    custom_hook = owned_command.replace(
+        f'"{str(commands.hook).replace(chr(92), "/")}"',
+        f'"{str(custom.resolve()).replace(chr(92), "/")}"',
+        1,
+    )
+    settings["hooks"]["PostToolUse"].append(
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": custom_hook}]}
+    )
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    mcp_path = project / ".mcp.json"
+    mcp = read_json(mcp_path)
+    mcp["mcpServers"]["token-governance-layer"]["command"] = str(
+        custom.resolve()
+    ).replace("\\", "/")
+    mcp_path.write_text(json.dumps(mcp), encoding="utf-8")
+
+    uninstall_project(project)
+
+    assert custom_hook in owned_hook_commands(project)
+    assert read_json(mcp_path)["mcpServers"]["token-governance-layer"][
+        "command"
+    ] == str(custom.resolve()).replace("\\", "/")
+
+
+def test_repair_rejects_custom_mcp_executable_borrowing_managed_args(tmp_path):
+    project = tmp_path / "project"
+    commands = stable_commands(tmp_path)
+    install_project(project, commands=commands)
+    custom = tmp_path / "custom-mcp.exe"
+    custom.write_text("custom", encoding="utf-8")
+    mcp_path = project / ".mcp.json"
+    mcp = read_json(mcp_path)
+    mcp["mcpServers"]["token-governance-layer"]["command"] = str(
+        custom.resolve()
+    ).replace("\\", "/")
+    mcp_path.write_text(json.dumps(mcp), encoding="utf-8")
+    before = project_snapshot(project)
+
+    with pytest.raises(InstallError, match="not owned"):
+        install_project(project, commands=commands, repair=True)
+
     assert project_snapshot(project) == before
 
 
@@ -488,6 +631,22 @@ def test_doctor_integration_is_byte_for_byte_read_only(tmp_path):
         "hook_smoke": True,
         "mcp_smoke": True,
     }
+
+
+def test_doctor_integration_fails_when_recorded_commands_are_corrupt(tmp_path):
+    project = tmp_path / "project"
+    commands = stable_commands(tmp_path)
+    install_project(project, commands=commands)
+    commands.hook.write_text("not executable", encoding="utf-8")
+    commands.mcp.write_text("not executable", encoding="utf-8")
+    before = project_snapshot(project)
+
+    report = doctor_project(project, integration=True)
+
+    assert report["ok"] is False
+    assert project_snapshot(project) == before
+    failed = {check["name"] for check in report["checks"] if not check["ok"]}
+    assert {"hook_smoke", "mcp_smoke"}.issubset(failed)
 
 
 def test_doctor_reports_incomplete_state_without_repairing(tmp_path):

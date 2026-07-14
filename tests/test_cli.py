@@ -43,7 +43,13 @@ def fake_global_install_env(tmp_path):
         ("tgl-mcp", "tgl-mcp.js"),
     ):
         if os.name == "nt":
-            (shim_dir / f"{name}.CMD").write_text("@echo off\n", encoding="utf-8")
+            relative_target = (
+                f"%~dp0\\node_modules\\token-governance-layer\\bin\\{script}"
+            )
+            (shim_dir / f"{name}.CMD").write_text(
+                f'@echo off\nnode "{relative_target}" %*\n',
+                encoding="utf-8",
+            )
         else:
             shim = shim_dir / name
             shim.symlink_to(package_root / "bin" / script)
