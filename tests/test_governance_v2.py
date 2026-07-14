@@ -319,9 +319,24 @@ def test_hook_cli_and_mcp_share_engine_owned_governance_truth(
     assert cli.returncode == 0, cli.stderr
     cli_truth = json.loads(cli.stdout)
 
-    mcp_request = {
+    mcp_initialize = {
         "jsonrpc": "2.0",
         "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "adapter-equivalence-test", "version": "1.0.0"},
+        },
+    }
+    mcp_initialized = {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {},
+    }
+    mcp_request = {
+        "jsonrpc": "2.0",
+        "id": 2,
         "method": "tools/call",
         "params": {
             "name": "govern_context",
@@ -330,14 +345,20 @@ def test_hook_cli_and_mcp_share_engine_owned_governance_truth(
     }
     mcp = subprocess.run(
         [sys.executable, "-m", "token_governance.mcp_server", "--db", str(mcp_db)],
-        input=json.dumps(mcp_request) + "\n",
+        input="".join(
+            json.dumps(message) + "\n"
+            for message in (mcp_initialize, mcp_initialized, mcp_request)
+        ),
         text=True,
         capture_output=True,
         check=False,
         env=subprocess_env(),
     )
     assert mcp.returncode == 0, mcp.stderr
-    mcp_envelope = json.loads(mcp.stdout)
+    mcp_responses = [json.loads(line) for line in mcp.stdout.splitlines()]
+    assert [response["id"] for response in mcp_responses] == [1, 2]
+    assert mcp_responses[0]["result"]["protocolVersion"] == "2025-06-18"
+    mcp_envelope = mcp_responses[1]
     mcp_truth = json.loads(mcp_envelope["result"]["content"][0]["text"])
 
     assert hook_content == cli_truth["content"] == mcp_truth["content"]
