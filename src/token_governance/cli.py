@@ -5,10 +5,12 @@ import json
 import os
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .core import GovernanceEngine
+from .config import GovernanceConfig
+from .contracts import GovernanceMode, GovernanceRequest, SourceKind, Strategy
+from .core import create_governance_engine, default_governance_config
 from .ledger import ContextLedger
 from .mcp_gateway import (
     load_config,
@@ -16,7 +18,6 @@ from .mcp_gateway import (
     parse_tool_policy,
     resolve_db_path,
 )
-from .policy import PolicyEngine
 
 DEFAULT_DB_PATH = str(Path.home() / ".token-governance" / "ledger.sqlite")
 DEFAULT_CLAUDE_LEDGER = ".tgl/claude-ledger.sqlite"
@@ -25,6 +26,10 @@ TGL_HOOK_COMMAND_MARKERS = (
     "tgl-claude-hook",
     "token_governance.claude_hook",
     "claude-tgl-hook",
+)
+GOVERN_MIGRATION_GUIDANCE = (
+    "content_type/source were removed; use --strategy "
+    "auto|repetitive_log|test_output|build_output"
 )
 
 
@@ -41,11 +46,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to the local SQLite ledger.",
     )
+    parser.add_argument("--config", help="Path to token-governance.config.json.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     govern = subparsers.add_parser("govern", help="Govern stdin and emit JSON result.")
-    govern.add_argument("--content-type", default="text")
-    govern.add_argument("--source", default="cli")
+    govern.add_argument(
+        "--strategy",
+        choices=("auto", "repetitive_log", "test_output", "build_output"),
+        default="auto",
+    )
+    govern.add_argument("--content-type", help=argparse.SUPPRESS)
+    govern.add_argument("--source", help=argparse.SUPPRESS)
 
     retrieve = subparsers.add_parser("retrieve", help="Retrieve original payload by receipt ID.")
     retrieve.add_argument("receipt_id")
@@ -110,33 +121,50 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 2
 
-    ledger = ContextLedger(db_path)
-    engine = GovernanceEngine(ledger=ledger, policy=PolicyEngine())
-
     try:
         if args.command == "govern":
+            if args.content_type is not None or args.source is not None:
+                parser.error(GOVERN_MIGRATION_GUIDANCE)
             payload = sys.stdin.read()
-            result = engine.govern_context(
-                payload,
-                content_type=args.content_type,
-                source=args.source,
+            config = _runtime_config(args.config, args.db)
+            ledger = ContextLedger(config.ledger.path)
+            engine = create_governance_engine(ledger, config=config)
+            request = GovernanceRequest(
+                source_kind=SourceKind.CLI,
+                tool_name=None,
+                tool_input={},
+                command_result=None,
+                raw_text=payload,
+                payload_bytes=len(payload.encode("utf-8")),
+                mode=GovernanceMode.MANUAL,
             )
-            _print_json(result)
+            explicit = None if args.strategy == "auto" else Strategy(args.strategy)
+            result = engine.govern_request(request, explicit_strategy=explicit)
+            _print_json(asdict(result))
+            if result.receipt_id is not None:
+                try:
+                    ledger.mark_emitted(result.receipt_id)
+                except Exception:
+                    pass
             return 0
 
         if args.command == "retrieve":
+            ledger = ContextLedger(_runtime_config(args.config, args.db).ledger.path)
             sys.stdout.write(ledger.retrieve_original(args.receipt_id))
             return 0
 
         if args.command == "inspect":
+            ledger = ContextLedger(_runtime_config(args.config, args.db).ledger.path)
             _print_json(ledger.explain_receipt(args.receipt_id))
             return 0
 
         if args.command == "stats":
+            ledger = ContextLedger(_runtime_config(args.config, args.db).ledger.path)
             _print_json(ledger.savings())
             return 0
 
         if args.command == "risks":
+            ledger = ContextLedger(_runtime_config(args.config, args.db).ledger.path)
             _print_json({"risks": ledger.risks()})
             return 0
 
@@ -163,7 +191,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_json(value: object) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2))
+    print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
+
+
+def _runtime_config(config_path: str | None, db_path: str | None) -> GovernanceConfig:
+    if config_path is None:
+        return default_governance_config(db_path or DEFAULT_DB_PATH)
+    overrides = {"ledger": {"path": db_path}} if db_path is not None else None
+    return GovernanceConfig.load(config_path, cli_overrides=overrides)
 
 
 def install_claude_project(

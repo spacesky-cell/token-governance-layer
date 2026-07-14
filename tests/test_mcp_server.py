@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def python_env():
     env = os.environ.copy()
@@ -87,9 +89,25 @@ def test_mcp_server_does_not_respond_to_notifications(tmp_path):
     assert proc.stdout == ""
 
 
-def test_mcp_govern_context_and_retrieve_original(tmp_path):
+@pytest.mark.parametrize(
+    ("strategy", "payload"),
+    [
+        ("repetitive_log", "ordinary repeated mcp line\n" * 120),
+        (
+            "test_output",
+            "============================= test session starts =============================\n"
+            "collecting ...\ncollecting ...\ncollecting ...\n"
+            "============================== 3 passed in 0.10s ==============================\n",
+        ),
+        (
+            "build_output",
+            "[1/3] compiling a.cc\n[2/3] compiling b.cc\n[3/3] compiling c.cc\n"
+            "build succeeded\n",
+        ),
+    ],
+)
+def test_mcp_govern_context_and_retrieve_original(tmp_path, strategy, payload):
     db_path = tmp_path / "mcp.sqlite"
-    payload = "\n".join(f"INFO repeated {i}" for i in range(70))
     govern_request = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -98,8 +116,7 @@ def test_mcp_govern_context_and_retrieve_original(tmp_path):
             "name": "govern_context",
             "arguments": {
                 "payload": payload,
-                "content_type": "log",
-                "source": "mcp-test",
+                "strategy": strategy,
             },
         },
     }
@@ -136,3 +153,75 @@ def test_mcp_govern_context_and_retrieve_original(tmp_path):
 
     assert exit_code == 0, stderr
     assert retrieve_response["result"]["content"][0]["text"] == payload
+
+
+def test_mcp_govern_schema_exposes_only_closed_strategy_enum(tmp_path):
+    db_path = tmp_path / "mcp.sqlite"
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "token_governance.mcp_server", "--db", str(db_path)],
+        input=json.dumps(request) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        env=python_env(),
+    )
+
+    tools = proc.stdout and json.loads(proc.stdout)["result"]["tools"]
+    govern = next(tool for tool in tools if tool["name"] == "govern_context")
+    properties = govern["inputSchema"]["properties"]
+    assert set(properties) == {"payload", "strategy"}
+    assert properties["strategy"]["enum"] == [
+        "auto",
+        "repetitive_log",
+        "test_output",
+        "build_output",
+    ]
+
+
+def test_mcp_rejects_legacy_content_type_with_migration_guidance(tmp_path):
+    db_path = tmp_path / "mcp.sqlite"
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "govern_context",
+            "arguments": {"payload": "value", "content_type": "log"},
+        },
+    }
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "token_governance.mcp_server", "--db", str(db_path)],
+        input=json.dumps(request) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        env=python_env(),
+    )
+
+    response = json.loads(proc.stdout)
+    assert "content_type/source were removed; use strategy" in response["error"]["message"]
+
+
+def test_mcp_config_ledger_path_is_not_overridden_by_an_implicit_default(tmp_path):
+    db_path = tmp_path / "configured.sqlite"
+    config_path = tmp_path / "token-governance.config.json"
+    config_path.write_text(
+        json.dumps({"ledger": {"path": str(db_path)}}),
+        encoding="utf-8",
+    )
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "token_governance.mcp_server", "--config", str(config_path)],
+        input=json.dumps(request) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        env=python_env(),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert db_path.exists()

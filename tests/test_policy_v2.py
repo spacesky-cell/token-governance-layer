@@ -158,6 +158,10 @@ class SpyEvents:
         self.calls.append(args)
 
 
+def zero_clock():
+    return 0.0
+
+
 def test_policy_uses_registered_order_and_derives_family_from_request():
     classifier = Classifier(CommandFamily.TEST)
     registry = Registry({Strategy.TEST_OUTPUT: True})
@@ -295,7 +299,11 @@ def test_cli_unknown_family_can_use_content_proven_repetitive_log_strategy():
 
     decision = PolicyEngine(
         classifier=Classifier(CommandFamily.UNKNOWN), registry=registry
-    ).decide_request(request, make_config())
+    ).decide_request(
+        request,
+        make_config(),
+        explicit_strategy=Strategy.REPETITIVE_LOG,
+    )
 
     assert decision.action is Action.TRANSFORM
     assert decision.strategy is Strategy.REPETITIVE_LOG
@@ -458,7 +466,7 @@ def test_bounded_fail_open_paths_do_not_estimate_tokens(
             make_config(),
             policy=replace(make_config().policy, max_payload_bytes=-1),
         )
-        clock = lambda: 0.0
+        clock = zero_clock
         expected_reason = ReasonCode.CONFIG_INVALID
     elif fail_open_case == "clock_error":
         request = make_request("ordinary output")
@@ -471,18 +479,19 @@ def test_bounded_fail_open_paths_do_not_estimate_tokens(
     elif fail_open_case == "payload_too_large":
         request = make_request("x" * 20)
         config = make_config(max_payload_bytes=10, max_stored_original_bytes=10)
-        clock = lambda: 0.0
+        clock = zero_clock
         expected_reason = ReasonCode.PAYLOAD_TOO_LARGE
     elif fail_open_case == "original_too_large":
         request = make_request("x" * 20)
         config = make_config(max_payload_bytes=100, max_stored_original_bytes=10)
-        clock = lambda: 0.0
+        clock = zero_clock
         expected_reason = ReasonCode.ORIGINAL_TOO_LARGE
     else:
         ticks = iter((0.0, 1.0))
         request = make_request("ordinary output")
         config = make_config(hook_deadline_ms=100)
-        clock = lambda: next(ticks)
+        def clock():
+            return next(ticks)
         expected_reason = ReasonCode.DEADLINE_EXCEEDED
 
     engine = GovernanceEngine(
@@ -772,3 +781,106 @@ def test_policy_module_does_not_import_concrete_shapers():
 
     assert "import shaper" not in policy_text.read_text(encoding="utf-8").lower()
     assert "from .shaper" not in policy_text.read_text(encoding="utf-8").lower()
+
+
+def test_legacy_generic_policy_surface_is_removed():
+    import token_governance.policy as policy_module
+
+    assert not hasattr(policy_module, "PolicyDecision")
+    assert not hasattr(policy_module, "PROTECTED_MARKERS")
+    assert not hasattr(PolicyEngine, "decide")
+    assert not hasattr(PolicyEngine, "is_protected_line")
+    with pytest.raises(TypeError):
+        PolicyEngine(min_tokens_for_compression=80)
+
+
+@pytest.mark.parametrize("source_kind", [SourceKind.CLI, SourceKind.MCP])
+@pytest.mark.parametrize(
+    "strategy",
+    [Strategy.REPETITIVE_LOG, Strategy.TEST_OUTPUT, Strategy.BUILD_OUTPUT],
+)
+def test_commandless_manual_surface_allows_explicit_matching_strategy(
+    source_kind,
+    strategy,
+):
+    registry = Registry({strategy: True})
+    decision = PolicyEngine(
+        classifier=Classifier(CommandFamily.UNKNOWN),
+        registry=registry,
+    ).decide_request(
+        make_request(
+            source_kind=source_kind,
+            mode=GovernanceMode.MANUAL,
+            tool_name=None,
+            tool_input={},
+        ),
+        make_config(),
+        explicit_strategy=strategy,
+    )
+
+    assert decision.action is Action.TRANSFORM
+    assert decision.strategy is strategy
+
+
+@pytest.mark.parametrize(
+    ("mode", "tool_name"),
+    [
+        (GovernanceMode.AUTO, None),
+        (GovernanceMode.MANUAL, "Bash"),
+    ],
+)
+def test_automatic_or_tool_bound_mcp_governance_is_rejected(mode, tool_name):
+    decision = PolicyEngine(
+        classifier=Classifier(CommandFamily.UNKNOWN),
+        registry=Registry({Strategy.REPETITIVE_LOG: True}),
+    ).decide_request(
+        make_request(
+            source_kind=SourceKind.MCP,
+            mode=mode,
+            tool_name=tool_name,
+            tool_input={},
+        ),
+        make_config(),
+        explicit_strategy=Strategy.REPETITIVE_LOG,
+    )
+
+    assert decision.action is Action.PASSTHROUGH
+    assert decision.reason_code is ReasonCode.NO_MATCHING_STRATEGY
+
+
+@pytest.mark.parametrize("source_kind", [SourceKind.CLI, SourceKind.MCP])
+def test_commandless_unknown_family_requires_an_explicit_strategy(source_kind):
+    decision = PolicyEngine(
+        classifier=Classifier(CommandFamily.UNKNOWN),
+        registry=Registry({Strategy.REPETITIVE_LOG: True}),
+    ).decide_request(
+        make_request(
+            source_kind=source_kind,
+            mode=GovernanceMode.MANUAL,
+            tool_name=None,
+            tool_input={},
+        ),
+        make_config(),
+    )
+
+    assert decision.action is Action.PASSTHROUGH
+    assert decision.reason_code is ReasonCode.NO_MATCHING_STRATEGY
+
+
+def test_automatic_cli_surface_is_rejected_even_with_explicit_strategy():
+    decision = PolicyEngine(
+        classifier=Classifier(CommandFamily.UNKNOWN),
+        registry=Registry({Strategy.REPETITIVE_LOG: True}),
+    ).decide_request(
+        make_request(
+            source_kind=SourceKind.CLI,
+            mode=GovernanceMode.AUTO,
+            tool_name=None,
+            tool_input={},
+        ),
+        make_config(),
+        explicit_strategy=Strategy.REPETITIVE_LOG,
+    )
+
+    assert decision.action is Action.PASSTHROUGH
+    assert decision.reason_code is ReasonCode.NO_MATCHING_STRATEGY

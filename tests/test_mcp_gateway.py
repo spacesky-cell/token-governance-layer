@@ -64,7 +64,7 @@ def test_gateway_exposes_compact_tool_surface(tmp_path):
     assert "Search code using a deliberately verbose description" not in serialized
 
 
-def test_gateway_lists_backend_catalog_and_gets_full_schema(tmp_path):
+def test_gateway_lists_catalog_but_rejects_legacy_schema_receipt_path(tmp_path):
     proc = start_gateway(tmp_path)
     try:
         catalog_response = send(
@@ -107,11 +107,7 @@ def test_gateway_lists_backend_catalog_and_gets_full_schema(tmp_path):
             "description": "Read a symbol implementation by fully qualified name.",
         },
     ]
-    full_schema = json.loads(schema_response["result"]["content"][0]["text"])
-    assert full_schema["name"] == "search_code"
-    assert full_schema["inputSchema"]["properties"]["query"]["description"].startswith("The exact semantic")
-    assert full_schema["receipt_id"]
-    assert full_schema["tokens_saved"] > 0
+    assert "Legacy ledger writes are disabled" in schema_response["error"]["message"]
 
 
 def test_gateway_invokes_backend_tool(tmp_path):
@@ -360,7 +356,7 @@ def test_gateway_accepts_utf8_bom_config_files(tmp_path):
     assert catalog["tools"][0]["qualified_name"] == "code::search_code"
 
 
-def test_gateway_exposes_savings_and_receipt_inspection(tmp_path):
+def test_gateway_legacy_schema_path_does_not_claim_savings(tmp_path):
     proc = start_gateway(tmp_path)
     try:
         schema_response = send(
@@ -375,8 +371,6 @@ def test_gateway_exposes_savings_and_receipt_inspection(tmp_path):
                 },
             },
         )
-        schema_payload = json.loads(schema_response["result"]["content"][0]["text"])
-        receipt_id = schema_payload["receipt_id"]
         savings_response = send(
             proc,
             {
@@ -386,31 +380,17 @@ def test_gateway_exposes_savings_and_receipt_inspection(tmp_path):
                 "params": {"name": "show_savings", "arguments": {}},
             },
         )
-        explain_response = send(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "explain_receipt",
-                    "arguments": {"receipt_id": receipt_id},
-                },
-            },
-        )
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
 
     savings = json.loads(savings_response["result"]["content"][0]["text"])
-    explanation = json.loads(explain_response["result"]["content"][0]["text"])
-    assert savings["receipt_count"] == 1
-    assert savings["tokens_saved"] == schema_payload["tokens_saved"]
-    assert explanation["receipt_id"] == receipt_id
-    assert explanation["content_type"] == "mcp_tool_schema"
+    assert "Legacy ledger writes are disabled" in schema_response["error"]["message"]
+    assert savings["receipt_count"] == 0
+    assert savings["tokens_saved"] == 0
 
 
-def test_gateway_retrieves_original_schema_from_receipt(tmp_path):
+def test_gateway_legacy_schema_path_creates_no_retrievable_receipt(tmp_path):
     proc = start_gateway(tmp_path)
     try:
         schema_response = send(
@@ -425,26 +405,11 @@ def test_gateway_retrieves_original_schema_from_receipt(tmp_path):
                 },
             },
         )
-        receipt_id = json.loads(schema_response["result"]["content"][0]["text"])["receipt_id"]
-        retrieve_response = send(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "retrieve_original",
-                    "arguments": {"receipt_id": receipt_id},
-                },
-            },
-        )
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
 
-    original = json.loads(retrieve_response["result"]["content"][0]["text"])
-    assert original["name"] == "search_code"
-    assert "inputSchema" in original
+    assert "Legacy ledger writes are disabled" in schema_response["error"]["message"]
 
 
 def test_gateway_policy_denies_tools_in_catalog_schema_and_invocation(tmp_path):

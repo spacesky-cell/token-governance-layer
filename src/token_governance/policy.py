@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from .config import GovernanceConfig
 from .contracts import (
     STRATEGY_RECOGNITION_ORDER,
@@ -18,75 +16,15 @@ from .contracts import (
     Strategy,
 )
 
-
-PROTECTED_MARKERS = (
-    "error",
-    "exception",
-    "failed",
-    "failure",
-    "assert",
-    "traceback",
-    " at ",
-    ".py:",
-    ".ts:",
-    ".tsx:",
-    ".js:",
-    ".jsx:",
-    ".rs:",
-    ".go:",
-)
-
-
-@dataclass(frozen=True)
-class PolicyDecision:
-    action: str
-    risk: str
-    policy: str
-    notes: list[str]
-
-
 class PolicyEngine:
     def __init__(
         self,
         *,
-        min_tokens_for_compression: int = 80,
         classifier: CommandFamilyClassifier | None = None,
         registry: ShaperRegistry | None = None,
     ):
-        self.min_tokens_for_compression = min_tokens_for_compression
         self.classifier = classifier
         self.registry = registry
-
-    def decide(self, *, payload: str, content_type: str, token_before: int) -> PolicyDecision:
-        if token_before < self.min_tokens_for_compression:
-            return PolicyDecision(
-                action="passthrough",
-                risk="low",
-                policy="default-conservative",
-                notes=["Payload is below compression threshold."],
-            )
-
-        if content_type in {"user_instruction", "secret", "security"}:
-            return PolicyDecision(
-                action="passthrough",
-                risk="medium",
-                policy="default-conservative",
-                notes=[f"{content_type} is protected from semantic compression."],
-            )
-
-        return PolicyDecision(
-            action="summarize",
-            risk="low",
-            policy="default-conservative",
-            notes=[
-                "Large payload summarized with protected lines preserved.",
-                "Original payload stored in local ledger and can be restored by receipt_id.",
-            ],
-        )
-
-    def is_protected_line(self, line: str) -> bool:
-        lowered = line.lower()
-        return any(marker in lowered for marker in PROTECTED_MARKERS)
 
     def decide_request(
         self,
@@ -140,6 +78,7 @@ class PolicyEngine:
                     strategy,
                     family,
                     request,
+                    explicit_strategy=explicit_strategy,
                 ):
                     continue
                 confidence = getattr(matcher, "confidence", Confidence.HIGH)
@@ -177,7 +116,15 @@ class PolicyEngine:
                 and family is not CommandFamily.UNKNOWN
             )
         if request.source_kind is SourceKind.CLI:
-            return request.tool_name is None
+            return (
+                request.mode is GovernanceMode.MANUAL
+                and request.tool_name is None
+            )
+        if request.source_kind is SourceKind.MCP:
+            return (
+                request.mode is GovernanceMode.MANUAL
+                and request.tool_name is None
+            )
         return False
 
     @staticmethod
@@ -185,7 +132,17 @@ class PolicyEngine:
         strategy: Strategy,
         family: CommandFamily,
         request: GovernanceRequest,
+        *,
+        explicit_strategy: Strategy | None,
     ) -> bool:
+        if (
+            explicit_strategy is strategy
+            and family is CommandFamily.UNKNOWN
+            and request.source_kind in {SourceKind.CLI, SourceKind.MCP}
+            and request.mode is GovernanceMode.MANUAL
+            and request.tool_name is None
+        ):
+            return True
         if strategy is Strategy.TEST_OUTPUT:
             return family is CommandFamily.TEST
         if strategy is Strategy.BUILD_OUTPUT:
@@ -194,10 +151,7 @@ class PolicyEngine:
             return False
         if family is not CommandFamily.UNKNOWN:
             return True
-        return (
-            request.source_kind is SourceKind.CLI
-            and request.tool_name is None
-        )
+        return False
 
     @staticmethod
     def _passthrough(reason_code: ReasonCode) -> GovernancePolicyDecision:

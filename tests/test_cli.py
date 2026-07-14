@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def run_cli(args, input_text=None):
     env = os.environ.copy()
@@ -20,10 +22,10 @@ def run_cli(args, input_text=None):
 
 def test_cli_govern_and_retrieve_roundtrip(tmp_path):
     db_path = tmp_path / "tgl.sqlite"
-    payload = "\n".join(f"INFO line {i}" for i in range(70))
+    payload = "ordinary repeated cli line\n" * 120
 
     govern = run_cli(
-        ["--db", str(db_path), "govern", "--content-type", "log"],
+        ["--db", str(db_path), "govern", "--strategy", "repetitive_log"],
         input_text=payload,
     )
 
@@ -36,6 +38,74 @@ def test_cli_govern_and_retrieve_roundtrip(tmp_path):
 
     assert retrieve.returncode == 0, retrieve.stderr
     assert retrieve.stdout == payload
+
+
+def test_cli_auto_means_no_explicit_strategy_and_passthrough_has_no_receipt(tmp_path):
+    db_path = tmp_path / "tgl.sqlite"
+
+    result = run_cli(
+        ["--db", str(db_path), "govern", "--strategy", "auto"],
+        input_text="repeated auto line\n" * 120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    governed = json.loads(result.stdout)
+    assert governed["action"] == "passthrough"
+    assert governed["receipt_id"] is None
+
+
+def test_cli_rejects_legacy_govern_arguments_with_fixed_guidance(tmp_path):
+    result = run_cli(
+        [
+            "--db",
+            str(tmp_path / "tgl.sqlite"),
+            "govern",
+            "--content-type",
+            "log",
+        ],
+        input_text="payload",
+    )
+
+    assert result.returncode == 2
+    assert (
+        "content_type/source were removed; use --strategy "
+        "auto|repetitive_log|test_output|build_output"
+    ) in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("strategy", "payload"),
+    [
+        (
+            "test_output",
+            "============================= test session starts =============================\n"
+            "collecting ...\ncollecting ...\ncollecting ...\n"
+            "============================== 3 passed in 0.10s ==============================\n",
+        ),
+        (
+            "build_output",
+            "[1/3] compiling a.cc\n[2/3] compiling b.cc\n[3/3] compiling c.cc\n"
+            "build succeeded\n",
+        ),
+    ],
+)
+def test_cli_explicit_structured_strategies_use_v2_engine(tmp_path, strategy, payload):
+    result = run_cli(
+        [
+            "--db",
+            str(tmp_path / f"{strategy}.sqlite"),
+            "govern",
+            "--strategy",
+            strategy,
+        ],
+        input_text=payload,
+    )
+
+    assert result.returncode == 0, result.stderr
+    governed = json.loads(result.stdout)
+    assert governed["action"] == "transform"
+    assert governed["strategy"] == strategy
+    assert governed["tokens_saved"] > 0
 
 
 def test_cli_doctor_reports_database_path(tmp_path):

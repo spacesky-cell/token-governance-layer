@@ -3,34 +3,58 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .core import GovernanceEngine
+from .config import GovernanceConfig
+from .contracts import GovernanceMode, GovernanceRequest, SourceKind, Strategy
+from .core import create_governance_engine, default_governance_config
 from .ledger import ContextLedger
-from .policy import PolicyEngine
+
+
+GOVERN_MIGRATION_GUIDANCE = (
+    "content_type/source were removed; use strategy "
+    "auto|repetitive_log|test_output|build_output"
+)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tgl-mcp")
     parser.add_argument(
         "--db",
-        default=str(Path.home() / ".token-governance" / "ledger.sqlite"),
+        default=None,
         help="Path to the local SQLite ledger.",
     )
+    parser.add_argument("--config", help="Path to token-governance.config.json.")
     args = parser.parse_args(argv)
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8-sig")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    server = McpServer(ContextLedger(args.db))
+    if args.config:
+        config = GovernanceConfig.load(
+            args.config,
+            cli_overrides={"ledger": {"path": args.db}} if args.db else None,
+        )
+    else:
+        config = default_governance_config(
+            args.db or str(Path.home() / ".token-governance" / "ledger.sqlite")
+        )
+    server = McpServer(ContextLedger(config.ledger.path), config=config)
     return server.run(sys.stdin, sys.stdout)
 
 
 class McpServer:
-    def __init__(self, ledger: ContextLedger):
+    def __init__(
+        self,
+        ledger: ContextLedger,
+        *,
+        config: GovernanceConfig | None = None,
+    ):
         self.ledger = ledger
-        self.engine = GovernanceEngine(ledger=ledger, policy=PolicyEngine())
+        self.engine = create_governance_engine(ledger, config=config)
+        self._pending_receipt_id: str | None = None
 
     def run(self, stdin: Any, stdout: Any) -> int:
         for line in stdin:
@@ -43,11 +67,19 @@ class McpServer:
                 continue
             stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
             stdout.flush()
+            if self._pending_receipt_id is not None:
+                try:
+                    self.ledger.mark_emitted(self._pending_receipt_id)
+                except Exception:
+                    pass
+                finally:
+                    self._pending_receipt_id = None
         return 0
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any] | None:
         request_id = request.get("id")
         method = request.get("method")
+        self._pending_receipt_id = None
         if request_id is None and isinstance(method, str) and method.startswith("notifications/"):
             return None
         try:
@@ -75,13 +107,42 @@ class McpServer:
     def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
         arguments = params.get("arguments", {})
+        if not isinstance(arguments, dict):
+            raise TypeError("tool arguments must be an object")
         if name == "govern_context":
-            result = self.engine.govern_context(
-                str(arguments.get("payload", "")),
-                content_type=str(arguments.get("content_type", "text")),
-                source=str(arguments.get("source", "mcp")),
+            if "content_type" in arguments or "source" in arguments:
+                raise ValueError(GOVERN_MIGRATION_GUIDANCE)
+            payload = arguments.get("payload", "")
+            strategy_value = arguments.get("strategy", "auto")
+            if not isinstance(payload, str):
+                raise TypeError("payload must be a string")
+            if strategy_value not in {
+                "auto",
+                "repetitive_log",
+                "test_output",
+                "build_output",
+            }:
+                raise ValueError(
+                    "strategy must be auto|repetitive_log|test_output|build_output"
+                )
+            request = GovernanceRequest(
+                source_kind=SourceKind.MCP,
+                tool_name=None,
+                tool_input={},
+                command_result=None,
+                raw_text=payload,
+                payload_bytes=len(payload.encode("utf-8")),
+                mode=GovernanceMode.MANUAL,
             )
-            return _text_result(json.dumps(result, ensure_ascii=False, indent=2))
+            explicit = (
+                None if strategy_value == "auto" else Strategy(strategy_value)
+            )
+            result = self.engine.govern_request(
+                request,
+                explicit_strategy=explicit,
+            )
+            self._pending_receipt_id = result.receipt_id
+            return _text_result(json.dumps(asdict(result), ensure_ascii=False, indent=2))
         if name == "retrieve_original":
             return _text_result(self.ledger.retrieve_original(str(arguments["receipt_id"])))
         if name == "explain_receipt":
@@ -110,8 +171,16 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "payload": {"type": "string"},
-                    "content_type": {"type": "string", "default": "text"},
-                    "source": {"type": "string", "default": "mcp"},
+                    "strategy": {
+                        "type": "string",
+                        "enum": [
+                            "auto",
+                            "repetitive_log",
+                            "test_output",
+                            "build_output",
+                        ],
+                        "default": "auto",
+                    },
                 },
                 "required": ["payload"],
             },

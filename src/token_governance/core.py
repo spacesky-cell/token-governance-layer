@@ -1,31 +1,49 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Mapping
 
 from .config import (
+    DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_HOOK_DEADLINE_MS,
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    DEFAULT_MAX_STORED_ORIGINAL_BYTES,
+    DEFAULT_RETENTION_DAYS,
     MAX_HOOK_DEADLINE_MS,
     MAX_LITERAL_SECRET_MARKER_LENGTH,
     MAX_LITERAL_SECRET_MARKERS,
     MAX_PAYLOAD_BYTES,
+    GatewayConfig,
+    GatewayToolPolicyConfig,
     GovernanceConfig,
+    LedgerConfig,
+    PolicyConfig,
 )
 from .contracts import (
     Action,
+    CommandFamily,
     Confidence,
     EventPort,
     GovernanceRequest,
     GovernanceResult,
+    PersistenceMode,
     PolicyDecision as GovernancePolicyDecision,
+    ProtectedContentBehavior,
     ReasonCode,
     Risk,
+    ShaperRegistry,
     SourceKind,
     Strategy,
+    VerificationResult,
 )
 from .ledger import ContextLedger
 from .policy import PolicyEngine
+from .preservation import PreservationVerifier
 from .secret_detector import SecretDetectionResult, SecretDetector
+from .shapers import BuiltinShaperRegistry, normalize_request_output
 from .tokenizer import estimate_tokens
 
 
@@ -37,95 +55,26 @@ class GovernanceEngine:
     secret_detector: SecretDetector | None = None
     events: EventPort | None = None
     clock: Callable[[], float] = monotonic
+    registry: ShaperRegistry | None = None
+    verifier: PreservationVerifier | None = None
 
-    def govern_context(
-        self,
-        payload: str,
-        *,
-        content_type: str = "text",
-        source: str = "unknown",
-    ) -> dict[str, Any]:
-        token_before = estimate_tokens(payload)
-        decision = self.policy.decide(
-            payload=payload,
-            content_type=content_type,
-            token_before=token_before,
-        )
-
-        if decision.action == "summarize":
-            governed = self._summarize(payload, content_type=content_type)
-        else:
-            governed = payload
-
-        token_after = estimate_tokens(governed)
-        action = decision.action
-        notes = list(decision.notes)
-        if action == "summarize" and token_after >= token_before:
-            governed = payload
-            token_after = token_before
-            action = "passthrough"
-            notes = [
-                "Summary was not shorter than the original payload.",
-                "Original payload passed through unchanged and receipted.",
-            ]
-
-        receipt_id = self.ledger.record(
-            source=source,
-            content_type=content_type,
-            action=action,
-            risk=decision.risk,
-            original_text=payload,
-            governed_text=governed,
-            token_before=token_before,
-            token_after=token_after,
-            policy=decision.policy,
-            notes=notes,
-        )
-
-        return {
-            "receipt_id": receipt_id,
-            "content": governed,
-            "content_type": content_type,
-            "source": source,
-            "action": action,
-            "risk": decision.risk,
-            "token_before": token_before,
-            "token_after": token_after,
-            "tokens_saved": token_before - token_after,
-            "policy": decision.policy,
-            "notes": notes,
-        }
-
-    def _summarize(self, payload: str, *, content_type: str) -> str:
-        lines = payload.splitlines()
-        protected = []
-        for line in lines:
-            if self.policy.is_protected_line(line):
-                protected.append(line)
-
-        protected = _dedupe_preserve_order(protected)[:20]
-        head = lines[:5]
-        tail = lines[-5:] if len(lines) > 10 else []
-        sample = _dedupe_preserve_order(head + tail)
-
-        sections = [
-            f"[Token Governance Summary]",
-            f"content_type: {content_type}",
-            f"original_lines: {len(lines)}",
-        ]
-        if protected:
-            sections.append("protected_lines:")
-            sections.extend(f"- {line}" for line in protected)
-        sections.append("representative_sample:")
-        sections.extend(f"- {line}" for line in sample[:10])
-        sections.append("restore: use retrieve_original(receipt_id) for full payload.")
-        return "\n".join(sections)
+    def __post_init__(self) -> None:
+        policy_registry = getattr(self.policy, "registry", None)
+        if self.registry is None:
+            self.registry = policy_registry or BuiltinShaperRegistry()
+        if isinstance(self.policy, PolicyEngine):
+            self.policy.registry = self.registry
+            if self.policy.classifier is None:
+                self.policy.classifier = _BuiltinCommandFamilyClassifier()
+        if self.verifier is None:
+            self.verifier = PreservationVerifier()
 
     def govern_request(
         self,
         request: GovernanceRequest,
         *,
         explicit_strategy: Strategy | None = None,
+        prepare_result: Callable[[GovernanceResult], None] | None = None,
     ) -> GovernanceResult:
         if not isinstance(request, GovernanceRequest):
             return self._passthrough_result(
@@ -274,13 +223,171 @@ class GovernanceEngine:
                 risk=Risk.UNAVAILABLE,
                 token_count=request.payload_bytes,
             )
-        return self._passthrough_result(
-            content=content,
-            source_kind=request.source_kind,
-            reason_code=decision.reason_code,
-            risk=self._risk_for_reason(decision.reason_code),
-            confidence=decision.confidence,
+        if decision.action is not Action.TRANSFORM:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=decision.reason_code,
+                risk=self._risk_for_reason(decision.reason_code),
+                confidence=decision.confidence,
+            )
+
+        assert self.registry is not None
+        assert self.verifier is not None
+        try:
+            shaped = self.registry.shape(decision.strategy, request)
+        except Exception:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.SHAPER_FAILED,
+                risk=Risk.UNAVAILABLE,
+                confidence=decision.confidence,
+            )
+        if self._deadline_exceeded(deadline):
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.DEADLINE_EXCEEDED,
+                risk=Risk.UNAVAILABLE,
+                token_count=request.payload_bytes,
+            )
+
+        try:
+            verification = self.verifier.verify(
+                decision.strategy,
+                request,
+                shaped,
+            )
+            if not isinstance(verification, VerificationResult):
+                raise TypeError("verifier returned an invalid result")
+        except Exception:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.PRESERVATION_FAILED,
+                risk=Risk.HIGH,
+                confidence=decision.confidence,
+            )
+        if not verification.ok:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.PRESERVATION_FAILED,
+                risk=Risk.HIGH,
+                confidence=decision.confidence,
+            )
+
+        try:
+            original_for_storage = normalize_request_output(request)
+            original_size = len(original_for_storage.encode("utf-8"))
+            candidate_size = len(shaped.content.encode("utf-8"))
+            if original_size > self.config.policy.max_stored_original_bytes:
+                return self._passthrough_result(
+                    content=content,
+                    source_kind=request.source_kind,
+                    reason_code=ReasonCode.ORIGINAL_TOO_LARGE,
+                    risk=Risk.MEDIUM,
+                    token_count=request.payload_bytes,
+                )
+            token_before = estimate_tokens(original_for_storage)
+            token_after = estimate_tokens(shaped.content)
+        except Exception:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.SHAPER_FAILED,
+                risk=Risk.UNAVAILABLE,
+                confidence=decision.confidence,
+            )
+        if candidate_size >= original_size or token_after >= token_before:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.NOT_SMALLER,
+                risk=Risk.MEDIUM,
+                confidence=decision.confidence,
+            )
+        if self._deadline_exceeded(deadline):
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.DEADLINE_EXCEEDED,
+                risk=Risk.UNAVAILABLE,
+                token_count=request.payload_bytes,
+            )
+
+        try:
+            receipt_id = self.ledger.allocate_receipt_id()
+        except Exception:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.LEDGER_FAILED,
+                risk=Risk.UNAVAILABLE,
+                confidence=decision.confidence,
+            )
+        risk = (
+            Risk.LOW
+            if request.source_kind is SourceKind.CLAUDE_HOOK
+            else Risk.MEDIUM
         )
+        result = GovernanceResult(
+            action=Action.TRANSFORM,
+            content=shaped.content,
+            risk=risk,
+            reason_code=ReasonCode.TRANSFORMED,
+            strategy=decision.strategy,
+            confidence=decision.confidence,
+            preservation_check=verification,
+            token_before=token_before,
+            token_after=token_after,
+            tokens_saved=token_before - token_after,
+            receipt_id=receipt_id,
+        )
+        if prepare_result is not None:
+            try:
+                prepare_result(result)
+            except Exception:
+                return self._passthrough_result(
+                    content=content,
+                    source_kind=request.source_kind,
+                    reason_code=ReasonCode.SERIALIZATION_FAILED,
+                    risk=Risk.UNAVAILABLE,
+                    confidence=decision.confidence,
+                )
+
+        try:
+            self.ledger.store_prepared(receipt_id, original_for_storage, result)
+        except Exception:
+            return self._passthrough_result(
+                content=content,
+                source_kind=request.source_kind,
+                reason_code=ReasonCode.LEDGER_FAILED,
+                risk=Risk.UNAVAILABLE,
+                confidence=decision.confidence,
+            )
+        self._record_event(request.source_kind, result)
+        return result
+
+    def _record_event(
+        self,
+        source_kind: SourceKind,
+        result: GovernanceResult,
+    ) -> None:
+        if self.events is None:
+            return
+        try:
+            self.events.record_event(
+                source_kind,
+                result.action,
+                result.risk,
+                result.reason_code,
+                result.token_before,
+                result.receipt_id,
+            )
+        except Exception:
+            pass
 
     def _config_is_usable(self) -> bool:
         if not isinstance(self.config, GovernanceConfig):
@@ -492,11 +599,80 @@ class GovernanceEngine:
         return result
 
 
-def _dedupe_preserve_order(items: list[str]) -> list[str]:
-    seen = set()
-    result = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result
+class _BuiltinCommandFamilyClassifier:
+    _TEST = re.compile(
+        r"^(?:(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?\s+-m\s+)?"
+        r"(?:\S*[\\/])?(?:pytest|py\.test|unittest|jest|vitest|mocha)(?:\.exe)?(?:\s|$)"
+        r"|^(?:cargo|go|dotnet)\s+test(?:\s|$)"
+        r"|^(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?\s+(?:run\s+)?test(?:\s|$)",
+        re.IGNORECASE,
+    )
+    _BUILD = re.compile(
+        r"^(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?\s+(?:run\s+)?build(?:\s|$)"
+        r"|^(?:cargo|dotnet)\s+build(?:\s|$)"
+        r"|^(?:cmake\s+--build|make|ninja|msbuild|webpack|vite\s+build|tsc)(?:\s|$)",
+        re.IGNORECASE,
+    )
+    _LOG = re.compile(
+        r"^(?:tail\b.*\.(?:log|out|txt)\b|journalctl\b|docker\s+logs\b|"
+        r"kubectl\s+logs\b|get-content\b.*\s-wait(?:\s|$))",
+        re.IGNORECASE,
+    )
+
+    def classify(self, request: GovernanceRequest) -> CommandFamily:
+        command = request.tool_input.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return CommandFamily.UNKNOWN
+        normalized = command.strip()
+        if self._TEST.search(normalized):
+            return CommandFamily.TEST
+        if self._BUILD.search(normalized):
+            return CommandFamily.BUILD
+        if self._LOG.search(normalized):
+            return CommandFamily.GENERIC_SHELL
+        return CommandFamily.UNKNOWN
+
+
+def default_governance_config(ledger_path: str | Path) -> GovernanceConfig:
+    path = Path(ledger_path).expanduser().resolve()
+    return GovernanceConfig(
+        ledger=LedgerConfig(path=path, retention_days=DEFAULT_RETENTION_DAYS),
+        policy=PolicyConfig(
+            enabled_strategies=(
+                Strategy.TEST_OUTPUT,
+                Strategy.BUILD_OUTPUT,
+                Strategy.REPETITIVE_LOG,
+            ),
+            protected_content_behavior=ProtectedContentBehavior.PASSTHROUGH,
+            persistence_mode=PersistenceMode.TRANSFORMED_ONLY,
+            max_payload_bytes=DEFAULT_MAX_PAYLOAD_BYTES,
+            max_stored_original_bytes=DEFAULT_MAX_STORED_ORIGINAL_BYTES,
+            hook_deadline_ms=DEFAULT_HOOK_DEADLINE_MS,
+            literal_secret_markers=(),
+        ),
+        gateway=GatewayConfig(
+            request_timeout_seconds=DEFAULT_GATEWAY_REQUEST_TIMEOUT_SECONDS,
+            backends=(),
+            tool_policy=GatewayToolPolicyConfig(allow=(), deny=()),
+        ),
+        config_path=path.parent / "token-governance.config.json",
+    )
+
+
+def create_governance_engine(
+    ledger: ContextLedger,
+    *,
+    config: GovernanceConfig | None = None,
+) -> GovernanceEngine:
+    registry = BuiltinShaperRegistry()
+    return GovernanceEngine(
+        ledger=ledger,
+        policy=PolicyEngine(
+            classifier=_BuiltinCommandFamilyClassifier(),
+            registry=registry,
+        ),
+        config=config or default_governance_config(ledger.path),
+        events=ledger,
+        registry=registry,
+        verifier=PreservationVerifier(),
+    )

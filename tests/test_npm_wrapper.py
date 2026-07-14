@@ -45,11 +45,11 @@ def test_npm_tgl_wrapper_runs_python_cli_help():
 
 def test_npm_tgl_wrapper_govern_retrieve_roundtrip(tmp_path):
     db_path = tmp_path / "ledger.sqlite"
-    payload = "\n".join(f"NPM wrapper repeated output {i % 3}" for i in range(90))
+    payload = "NPM wrapper repeated output\n" * 120
 
     govern = run_node_bin(
         "tgl.js",
-        ["--db", str(db_path), "govern", "--content-type", "log"],
+        ["--db", str(db_path), "govern", "--strategy", "repetitive_log"],
         input_text=payload,
     )
 
