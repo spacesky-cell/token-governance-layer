@@ -94,7 +94,7 @@ class McpServer:
                     continue
                 try:
                     request = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     response = _error(None, -32700, "Parse error")
                 else:
                     response = self.handle(request)
