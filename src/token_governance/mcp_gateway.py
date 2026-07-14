@@ -211,6 +211,8 @@ class StdioMcpBackend:
 
     PROTOCOL_VERSION = "2025-06-18"
     STDERR_RING_BYTES = 64 * 1024
+    WRITE_QUEUE_MAXSIZE = 4
+    MAX_FRAME_BYTES = 8 * 1024 * 1024
 
     def __init__(self, command: list[str], *, name: str = "backend", timeout_seconds: int = 10,
                  on_notification: Any | None = None):
@@ -228,7 +230,10 @@ class StdioMcpBackend:
         self._pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
         self._lock = threading.Lock()
         self._writer_start_lock = threading.Lock()
-        self._write_queue: queue.Queue[tuple[bytes, threading.Event, dict[str, Any]] | None] = queue.Queue()
+        self._write_queue: queue.Queue[tuple[bytes, threading.Event, dict[str, Any]] | None] = queue.Queue(
+            maxsize=self.WRITE_QUEUE_MAXSIZE
+        )
+        self._writer_stop = threading.Event()
         self._writer: threading.Thread | None = None
         self._stderr = deque()  # type: deque[bytes]
         self._stderr_size = 0
@@ -345,12 +350,20 @@ class StdioMcpBackend:
         if proc is None or proc.stdin is None:
             raise RuntimeError(f"Backend {self.name} has no stdin")
         raw = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(raw) > self.MAX_FRAME_BYTES:
+            raise ValueError(f"Backend {self.name} frame too large")
         self._ensure_writer()
         event = threading.Event()
         slot: dict[str, Any] = {}
-        self._write_queue.put((raw, event, slot))
         write_deadline = deadline if deadline is not None else time.monotonic() + self.timeout_seconds
+        try:
+            self._write_queue.put(
+                (raw, event, slot), timeout=max(0.0, write_deadline - time.monotonic())
+            )
+        except queue.Full as exc:
+            raise TimeoutError(f"Backend {self.name} write queue is full") from exc
         if not event.wait(max(0.0, write_deadline - time.monotonic())):
+            slot["cancelled"] = True
             raise TimeoutError(f"Backend {self.name} write timed out")
         if "exception" in slot:
             raise RuntimeError(f"Backend {self.name} transport failed") from slot["exception"]
@@ -368,10 +381,18 @@ class StdioMcpBackend:
 
     def _write_frames(self) -> None:
         while True:
-            item = self._write_queue.get()
+            try:
+                item = self._write_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._writer_stop.is_set():
+                    return
+                continue
             if item is None:
                 return
             raw, event, slot = item
+            if slot.get("cancelled"):
+                event.set()
+                continue
             proc = self.proc
             try:
                 if proc is None or proc.stdin is None:
@@ -501,7 +522,11 @@ class StdioMcpBackend:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=2)
-        self._write_queue.put(None)
+        self._writer_stop.set()
+        try:
+            self._write_queue.put_nowait(None)
+        except queue.Full:
+            pass
         if self._writer is not None:
             self._writer.join(timeout=2)
         stdin_closer.join(timeout=0.1)
@@ -539,6 +564,7 @@ class McpGateway:
         self._current_upstream = threading.local()
         self._output_lock = threading.Lock()
         self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._cancelled_pending: dict[Any, str] = {}
 
@@ -558,14 +584,17 @@ class McpGateway:
             if request.get("method") == "tools/call" and "id" in request and self._state is GatewayState.ACTIVE:
                 self._register_upstream(request.get("id"))
                 worker = threading.Thread(target=self._handle_async, args=(request, stdout), daemon=True)
-                self._workers.add(worker)
+                with self._workers_lock:
+                    self._workers.add(worker)
                 worker.start()
             else:
                 response = self.handle(request)
                 if response is not None:
                     self._write_upstream(stdout, response)
         self.close()
-        for worker in tuple(self._workers):
+        with self._workers_lock:
+            workers = tuple(self._workers)
+        for worker in workers:
             worker.join(timeout=2)
         return 0
 
@@ -575,7 +604,8 @@ class McpGateway:
             if response is not None:
                 self._write_upstream(stdout, response)
         finally:
-            self._workers.discard(threading.current_thread())
+            with self._workers_lock:
+                self._workers.discard(threading.current_thread())
 
     def _write_upstream(self, stdout: Any, response: dict[str, Any]) -> None:
         with self._output_lock:
@@ -654,8 +684,8 @@ class McpGateway:
             pending = self._upstream_pending.get(request_id)
             if not pending:
                 return
+            self._cancelled_pending[request_id] = str(reason)
             if not pending[1]:
-                self._cancelled_pending[request_id] = str(reason)
                 return
         if pending and pending[1]:
             self.backends[pending[0]].cancel(pending[1], str(reason))
@@ -674,9 +704,19 @@ class McpGateway:
             if pending is None:
                 return
             self._upstream_pending[upstream_id] = (backend_name, backend_id)
-            reason = self._cancelled_pending.pop(upstream_id, None)
+            reason = self._cancelled_pending.get(upstream_id)
         if reason is not None:
             self.backends[backend_name].cancel(backend_id, reason)
+
+    def _backend_request_observer(self, backend_name: str) -> Any | None:
+        upstream_id = getattr(self._current_upstream, "request_id", None)
+        if upstream_id is None:
+            return None
+        return lambda backend_id: self._bind_backend_request(
+            upstream_id,
+            backend_name,
+            backend_id,
+        )
 
     def _on_backend_notification(self, backend_name: str, message: dict[str, Any]) -> None:
         if message.get("method") == "notifications/tools/list_changed":
@@ -697,7 +737,12 @@ class McpGateway:
             query = arguments.get("query")
             if query is not None and not isinstance(query, str):
                 raise TypeError("list_backend_tools.query must be a string.")
-            payload: dict[str, Any] = {"tools": self._tool_catalog(query=query)}
+            payload: dict[str, Any] = {
+                "tools": self._tool_catalog(
+                    query=query,
+                    request_id_observer=self._backend_request_observer,
+                )
+            }
             unavailable = self._unavailable_backends()
             if unavailable:
                 payload["unavailable_backends"] = unavailable
@@ -710,7 +755,10 @@ class McpGateway:
             )
         if name == "get_tool_schema":
             tool_name = str(arguments["tool_name"])
-            backend_name, schema = self._find_tool(tool_name)
+            backend_name, schema = self._find_tool(
+                tool_name,
+                request_id_observer=self._backend_request_observer,
+            )
             receipt_id, tokens_saved = self._record_schema_receipt(schema)
             payload = dict(schema)
             payload["backend"] = backend_name
@@ -723,7 +771,10 @@ class McpGateway:
             tool_args = arguments.get("arguments", {})
             if not isinstance(tool_args, dict):
                 raise TypeError("invoke_tool.arguments must be an object.")
-            backend_name, schema = self._find_tool(tool_name)
+            backend_name, schema = self._find_tool(
+                tool_name,
+                request_id_observer=self._backend_request_observer,
+            )
             upstream_id = getattr(self._current_upstream, "request_id", None)
             if self._is_upstream_cancelled(upstream_id):
                 raise RuntimeError("Request cancelled")
@@ -752,22 +803,39 @@ class McpGateway:
             )
         raise KeyError(f"Unknown gateway tool: {name}")
 
-    def _backend_tools(self, backend_name: str) -> list[dict[str, Any]]:
+    def _backend_tools(
+        self,
+        backend_name: str,
+        *,
+        request_id_observer: Any | None = None,
+    ) -> list[dict[str, Any]]:
         backend = self.backends[backend_name]
         if backend.state is not BackendState.ACTIVE:
             return []
         if backend_name not in self._tools:
-            result = backend.request("tools/list")
+            result = backend.request("tools/list", request_id_observer=request_id_observer)
             tools = result.get("tools", [])
             if not isinstance(tools, list):
                 raise TypeError("Backend tools/list result must contain a tools array.")
             self._tools[backend_name] = tools
         return self._tools[backend_name]
 
-    def _tool_catalog(self, query: str | None = None) -> list[dict[str, str]]:
+    def _tool_catalog(
+        self,
+        query: str | None = None,
+        *,
+        request_id_observer: Any | None = None,
+    ) -> list[dict[str, str]]:
         catalog = []
         for backend_name in self.backends:
-            for tool in self._backend_tools(backend_name):
+            for tool in self._backend_tools(
+                backend_name,
+                request_id_observer=(
+                    request_id_observer(backend_name)
+                    if request_id_observer is not None
+                    else None
+                ),
+            ):
                 raw_name = str(tool.get("name", ""))
                 qualified_name = self._qualified_name(backend_name, raw_name)
                 if not self.tool_policy.is_allowed(qualified_name):
@@ -794,14 +862,26 @@ class McpGateway:
             if backend.state is not BackendState.ACTIVE
         ]
 
-    def _find_tool(self, tool_name: str) -> tuple[str, dict[str, Any]]:
+    def _find_tool(
+        self,
+        tool_name: str,
+        *,
+        request_id_observer: Any | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         if "::" in tool_name:
             backend_name, raw_name = tool_name.split("::", 1)
             if backend_name not in self.backends:
                 raise KeyError(f"Backend not found: {backend_name}")
             if self.backends[backend_name].state is not BackendState.ACTIVE:
                 raise RuntimeError(f"Backend unavailable: {backend_name}")
-            for tool in self._backend_tools(backend_name):
+            for tool in self._backend_tools(
+                backend_name,
+                request_id_observer=(
+                    request_id_observer(backend_name)
+                    if request_id_observer is not None
+                    else None
+                ),
+            ):
                 if tool.get("name") == raw_name:
                     self.tool_policy.assert_allowed(self._qualified_name(backend_name, raw_name))
                     return backend_name, tool
@@ -809,7 +889,14 @@ class McpGateway:
 
         matches = []
         for backend_name in self.backends:
-            for tool in self._backend_tools(backend_name):
+            for tool in self._backend_tools(
+                backend_name,
+                request_id_observer=(
+                    request_id_observer(backend_name)
+                    if request_id_observer is not None
+                    else None
+                ),
+            ):
                 if tool.get("name") == tool_name:
                     qualified_name = self._qualified_name(backend_name, tool_name)
                     if self.tool_policy.is_allowed(qualified_name):

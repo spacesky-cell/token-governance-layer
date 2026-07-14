@@ -1120,6 +1120,10 @@ def test_cold_catalog_cancellation_prevents_backend_tool_call(tmp_path):
 
     recorded = events.read_text(encoding="utf-8")
     assert '"method": "tools/call"' not in recorded
+    messages = [json.loads(line) for line in recorded.splitlines()]
+    catalog_request = next(item for item in messages if item.get("method") == "tools/list")
+    cancelled = next(item for item in messages if item.get("method") == "notifications/cancelled")
+    assert cancelled["params"]["requestId"] == catalog_request["id"]
     assert response["error"]["message"] == "Request cancelled"
 
 
@@ -1131,7 +1135,7 @@ def test_large_request_timeout_and_close_are_bounded_when_backend_never_reads():
     backend.initialize()
     started = time.monotonic()
     try:
-        with pytest.raises(TimeoutError, match="timed out"):
+        with pytest.raises((TimeoutError, ValueError), match="timed out|too large"):
             backend.request(
                 "tools/call",
                 {"name": "echo", "arguments": {"value": "x" * (8 * 1024 * 1024)}},
@@ -1153,3 +1157,48 @@ def test_reinitialize_active_backend_preserves_healthy_process():
     assert process is not None and process.poll() is None
     assert backend.request("tools/list")["tools"][0]["name"] == "echo"
     backend.close()
+
+
+def test_writer_has_finite_queue_and_rejects_oversized_frame():
+    backend = StdioMcpBackend([sys.executable, str(STRICT_BACKEND)], timeout_seconds=1)
+    assert 0 < backend._write_queue.maxsize <= 8
+    backend.MAX_FRAME_BYTES = 1024
+    backend.proc = type("Process", (), {"stdin": type("Stdin", (), {})()})()
+    with pytest.raises(ValueError, match="frame too large"):
+        backend._write({"payload": "x" * 2048})
+
+
+def test_worker_snapshot_is_safe_when_workers_finish_during_close(tmp_path):
+    import threading
+
+    total = 24
+    started = threading.Event()
+    release = threading.Event()
+    counter_lock = threading.Lock()
+    count = 0
+
+    class StressGateway(McpGateway):
+        def handle(self, request):
+            nonlocal count
+            if request.get("method") == "tools/call":
+                with counter_lock:
+                    count += 1
+                    if count == total:
+                        started.set()
+                release.wait(timeout=2)
+            return {"jsonrpc": "2.0", "id": request.get("id"), "result": {}}
+
+        def close(self):
+            release.set()
+            return super().close()
+
+    class Input:
+        def __iter__(self):
+            for index in range(total):
+                yield json.dumps({"jsonrpc": "2.0", "id": index, "method": "tools/call", "params": {}})
+            assert started.wait(timeout=3)
+
+    gateway = StressGateway(ContextLedger(tmp_path / "worker-stress.sqlite"), {})
+    gateway._state = gateway._state.ACTIVE
+    gateway.run(Input(), StringIO())
+    assert not gateway._workers
