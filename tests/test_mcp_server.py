@@ -282,6 +282,30 @@ def test_malformed_json_and_invalid_envelopes_return_protocol_errors(tmp_path):
     assert "not-json" not in proc.stdout
 
 
+def test_invalid_utf8_is_a_single_safe_parse_error(tmp_path):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "token_governance.mcp_server",
+            "--db",
+            str(tmp_path / "mcp.sqlite"),
+        ],
+        input=b"\xff\n",
+        capture_output=True,
+        check=False,
+        env=python_env(),
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.splitlines() == [
+        b'{"jsonrpc": "2.0", "id": null, "error": '
+        b'{"code": -32700, "message": "Parse error"}}'
+    ]
+    assert b"Traceback" not in proc.stderr
+    assert b"\\xff" not in proc.stderr
+
+
 def test_mcp_server_accepts_utf8_bom_prefixed_json_lines(tmp_path):
     messages = active_messages(
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}

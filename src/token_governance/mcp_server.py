@@ -49,8 +49,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", help="Path to token-governance.config.json.")
     args = parser.parse_args(argv)
-    if hasattr(sys.stdin, "reconfigure"):
-        sys.stdin.reconfigure(encoding="utf-8-sig")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     if args.config:
@@ -63,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
             args.db or str(Path.home() / ".token-governance" / "ledger.sqlite")
         )
     server = McpServer(ContextLedger(config.ledger.path), config=config)
-    return server.run(sys.stdin, sys.stdout)
+    stdin = getattr(sys.stdin, "buffer", sys.stdin)
+    return server.run(stdin, sys.stdout)
 
 
 class McpServer:
@@ -80,16 +79,25 @@ class McpServer:
         self._cancelled_request_ids: set[str | int] = set()
 
     def run(self, stdin: Any, stdout: Any) -> int:
-        for line in stdin:
-            line = line.strip().lstrip("\ufeff")
-            if not line:
-                continue
+        for raw_line in stdin:
             try:
-                request = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                line = (
+                    raw_line.decode("utf-8")
+                    if isinstance(raw_line, bytes)
+                    else raw_line
+                )
+            except UnicodeDecodeError:
                 response = _error(None, -32700, "Parse error")
             else:
-                response = self.handle(request)
+                line = line.strip().lstrip("\ufeff")
+                if not line:
+                    continue
+                try:
+                    request = json.loads(line)
+                except json.JSONDecodeError:
+                    response = _error(None, -32700, "Parse error")
+                else:
+                    response = self.handle(request)
             if response is None:
                 continue
             stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
