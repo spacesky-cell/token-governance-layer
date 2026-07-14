@@ -2,14 +2,35 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+import threading
+from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from .ledger import ContextLedger
 from .tokenizer import estimate_tokens
+
+
+class GatewayState(str, Enum):
+    CREATED = "CREATED"
+    INITIALIZED = "INITIALIZED"
+    ACTIVE = "ACTIVE"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+
+
+class BackendState(str, Enum):
+    STARTING = "STARTING"
+    INITIALIZED = "INITIALIZED"
+    ACTIVE = "ACTIVE"
+    FAILED = "FAILED"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,10 +68,12 @@ def main(argv: list[str] | None = None) -> int:
         config,
     )
     backends = {spec.name: StdioMcpBackend(spec.command) for spec in backend_specs}
+    request_timeout_seconds = parse_request_timeout(config)
     gateway = McpGateway(
         ContextLedger(db_path),
         backends,
         tool_policy=parse_tool_policy(config),
+        request_timeout_seconds=request_timeout_seconds,
     )
     try:
         return gateway.run(sys.stdin, sys.stdout)
@@ -164,6 +187,16 @@ def parse_tool_policy(config: dict[str, Any]) -> GatewayToolPolicy:
     return GatewayToolPolicy(allow=frozenset(allow), deny=frozenset(deny))
 
 
+def parse_request_timeout(config: dict[str, Any]) -> int:
+    gateway = config.get("gateway", {})
+    if not isinstance(gateway, dict):
+        raise ValueError("Config gateway must be an object.")
+    value = gateway.get("request_timeout_seconds", 10)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 120:
+        raise ValueError("Config gateway.request_timeout_seconds must be an integer from 1 to 120.")
+    return value
+
+
 def _parse_policy_list(raw_policy: dict[str, Any], key: str) -> list[str]:
     value = raw_policy.get(key, [])
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
@@ -172,49 +205,233 @@ def _parse_policy_list(raw_policy: dict[str, Any], key: str) -> list[str]:
 
 
 class StdioMcpBackend:
-    def __init__(self, command: list[str]):
+    """A small MCP client with independent protocol and stderr readers."""
+
+    PROTOCOL_VERSION = "2025-06-18"
+    STDERR_RING_BYTES = 64 * 1024
+
+    def __init__(self, command: list[str], *, name: str = "backend", timeout_seconds: int = 10,
+                 on_notification: Any | None = None):
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 120:
+            raise ValueError("timeout_seconds must be between 1 and 120")
         self.command = command
+        self.name = name
+        self.timeout_seconds = timeout_seconds
+        self.on_notification = on_notification
         self.next_id = 1
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.state = BackendState.STARTING
+        self.capabilities: dict[str, Any] = {}
+        self.failure_reason: str | None = None
+        self._pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+        self._stderr = deque()  # type: deque[bytes]
+        self._stderr_size = 0
+        self._reader: threading.Thread | None = None
+        self._stderr_reader: threading.Thread | None = None
+
+    @property
+    def stderr_ring(self) -> str:
+        with self._lock:
+            return b"".join(self._stderr).decode("utf-8", errors="replace")
+
+    def start(self) -> None:
+        if self.proc is not None:
+            return
         self.proc = subprocess.Popen(
-            command,
+            self.command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=False,
+            bufsize=0,
         )
+        self._reader = threading.Thread(target=self._read_stdout, name=f"tgl-{self.name}-stdout", daemon=True)
+        self._stderr_reader = threading.Thread(target=self._read_stderr, name=f"tgl-{self.name}-stderr", daemon=True)
+        self._reader.start()
+        self._stderr_reader.start()
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        if self.proc.stdin is None or self.proc.stdout is None:
+    def initialize(self) -> None:
+        self.start()
+        try:
+            result = self.request("initialize", {
+                "protocolVersion": self.PROTOCOL_VERSION,
+                "clientInfo": {"name": "token-governance-mcp-gateway", "version": "0.2.0"},
+                "capabilities": {},
+            })
+            if result.get("protocolVersion") != self.PROTOCOL_VERSION:
+                raise RuntimeError("Backend MCP protocol version is incompatible")
+            caps = result.get("capabilities", {})
+            if not isinstance(caps, dict):
+                raise RuntimeError("Backend MCP capabilities are invalid")
+            self.capabilities = dict(caps)
+            self.state = BackendState.INITIALIZED
+            self.notify("notifications/initialized", {})
+            self.state = BackendState.ACTIVE
+        except Exception as exc:
+            self.failure_reason = _redact(str(exc))
+            self.state = BackendState.FAILED
+            self.close()
+            raise
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        self._write({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    def request(self, method: str, params: dict[str, Any] | None = None,
+                *, request_id_observer: Any | None = None) -> dict[str, Any]:
+        if self.state in {BackendState.CLOSING, BackendState.CLOSED, BackendState.FAILED}:
+            raise RuntimeError(f"Backend {self.name} is unavailable ({self.state.value.lower()})")
+        if self.proc is None or self.proc.stdin is None:
             raise RuntimeError("Backend MCP process has no stdio pipes.")
-        request_id = self.next_id
-        self.next_id += 1
+        with self._lock:
+            request_id = self.next_id
+            self.next_id += 1
+            event = threading.Event()
+            slot: dict[str, Any] = {}
+            self._pending[request_id] = (event, slot)
+        if request_id_observer is not None:
+            request_id_observer(request_id)
         request = {
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
             "params": params or {},
         }
-        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-        self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
-        if not line:
-            stderr = self.proc.stderr.read() if self.proc.stderr else ""
-            raise RuntimeError(f"Backend MCP process exited without response. {stderr}".strip())
-        response = json.loads(line)
-        if "error" in response:
-            raise RuntimeError(response["error"].get("message", "Backend MCP error"))
-        return response["result"]
+        try:
+            self._write(request)
+            if not event.wait(self.timeout_seconds):
+                self.cancel(request_id)
+                raise TimeoutError(f"Backend {self.name} request timed out")
+            if "exception" in slot:
+                raise RuntimeError(str(slot["exception"]))
+            response = slot.get("response")
+            if not isinstance(response, dict):
+                raise RuntimeError("Backend MCP response is invalid")
+            if "error" in response:
+                error = response.get("error")
+                message = error.get("message", "Backend MCP error") if isinstance(error, dict) else "Backend MCP error"
+                raise RuntimeError(_redact(message))
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("Backend MCP result is invalid")
+            return result
+        finally:
+            with self._lock:
+                self._pending.pop(request_id, None)
+
+    def cancel(self, request_id: int, reason: str = "gateway timeout or cancellation") -> None:
+        with self._lock:
+            if request_id not in self._pending:
+                return
+        try:
+            self.notify("notifications/cancelled", {"requestId": request_id, "reason": _redact(reason)})
+        except Exception:
+            pass
+
+    def _write(self, payload: dict[str, Any]) -> None:
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            raise RuntimeError(f"Backend {self.name} has no stdin")
+        raw = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            proc.stdin.write(raw)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(f"Backend {self.name} transport failed") from exc
+
+    def _read_stdout(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for raw_line in iter(proc.stdout.readline, b""):
+                if not raw_line:
+                    break
+                try:
+                    message = json.loads(raw_line.decode("utf-8"))
+                except Exception:
+                    self._fail_pending("Backend MCP protocol error")
+                    continue
+                if not isinstance(message, dict):
+                    self._fail_pending("Backend MCP protocol error")
+                    continue
+                if "id" not in message:
+                    if self.on_notification is not None:
+                        try:
+                            self.on_notification(self.name, message)
+                        except Exception:
+                            pass
+                    continue
+                request_id = message.get("id")
+                with self._lock:
+                    pending = self._pending.get(request_id)
+                if pending is None:
+                    continue
+                event, slot = pending
+                slot["response"] = message
+                event.set()
+        finally:
+            self._fail_pending("Backend MCP process exited without response")
+
+    def _read_stderr(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        carry = b""
+        while True:
+            chunk = proc.stderr.read(4096)
+            if not chunk:
+                break
+            carry += chunk
+            newline = carry.rfind(b"\n")
+            if newline >= 0:
+                self._append_stderr(carry[: newline + 1])
+                carry = carry[newline + 1 :]
+            elif len(carry) > 4096:
+                self._append_stderr(carry[:-1024])
+                carry = carry[-1024:]
+        if carry:
+            self._append_stderr(carry)
+
+    def _append_stderr(self, value: bytes) -> None:
+        redacted = _redact_bytes(value)
+        with self._lock:
+            self._stderr.append(redacted)
+            self._stderr_size += len(redacted)
+            while self._stderr_size > self.STDERR_RING_BYTES and self._stderr:
+                self._stderr_size -= len(self._stderr.popleft())
+
+    def _fail_pending(self, message: str) -> None:
+        with self._lock:
+            pending = list(self._pending.values())
+        for event, slot in pending:
+            slot["exception"] = message
+            event.set()
 
     def close(self) -> None:
-        if self.proc.poll() is not None:
+        proc = self.proc
+        if proc is None:
+            self.state = BackendState.CLOSED
             return
-        if self.proc.stdin is not None:
-            self.proc.stdin.close()
+        self.state = BackendState.CLOSING
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
         try:
-            self.proc.wait(timeout=3)
+            proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            self.proc.terminate()
-            self.proc.wait(timeout=3)
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        for thread in (self._reader, self._stderr_reader):
+            if thread is not None:
+                thread.join(timeout=2)
+        self.state = BackendState.CLOSED
 
 
 class McpGateway:
@@ -223,46 +440,140 @@ class McpGateway:
         ledger: ContextLedger,
         backends: dict[str, StdioMcpBackend],
         tool_policy: GatewayToolPolicy | None = None,
+        request_timeout_seconds: int = 10,
     ):
+        if (
+            isinstance(request_timeout_seconds, bool)
+            or not isinstance(request_timeout_seconds, int)
+            or not 1 <= request_timeout_seconds <= 120
+        ):
+            raise ValueError("request_timeout_seconds must be between 1 and 120")
         self.ledger = ledger
         self.backends = backends
         self.tool_policy = tool_policy or GatewayToolPolicy(allow=frozenset(), deny=frozenset())
+        self.request_timeout_seconds = request_timeout_seconds
+        for name, backend in self.backends.items():
+            backend.name = name
+            backend.timeout_seconds = request_timeout_seconds
+            backend.on_notification = self._on_backend_notification
         self._tools: dict[str, list[dict[str, Any]]] = {}
+        self._state = GatewayState.CREATED
+        self._upstream_pending: dict[Any, tuple[str, int]] = {}
+        self._current_upstream = threading.local()
+        self._output_lock = threading.Lock()
+        self._workers: set[threading.Thread] = set()
 
     def run(self, stdin: Any, stdout: Any) -> int:
         for line in stdin:
             line = line.strip()
             if not line:
                 continue
-            request = json.loads(line)
-            response = self.handle(request)
-            stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-            stdout.flush()
+            try:
+                request = json.loads(line)
+            except (TypeError, ValueError):
+                self._write_upstream(stdout, _error(None, -32700, "Parse error"))
+                continue
+            if not isinstance(request, dict):
+                self._write_upstream(stdout, _error(None, -32600, "Invalid Request"))
+                continue
+            if request.get("method") == "tools/call" and "id" in request and self._state is GatewayState.ACTIVE:
+                worker = threading.Thread(target=self._handle_async, args=(request, stdout), daemon=True)
+                self._workers.add(worker)
+                worker.start()
+            else:
+                response = self.handle(request)
+                if response is not None:
+                    self._write_upstream(stdout, response)
+        self.close()
+        for worker in tuple(self._workers):
+            worker.join(timeout=2)
         return 0
 
-    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _handle_async(self, request: dict[str, Any], stdout: Any) -> None:
+        try:
+            response = self.handle(request)
+            if response is not None:
+                self._write_upstream(stdout, response)
+        finally:
+            self._workers.discard(threading.current_thread())
+
+    def _write_upstream(self, stdout: Any, response: dict[str, Any]) -> None:
+        with self._output_lock:
+            stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+            stdout.flush()
+
+    def handle(self, request: dict[str, Any]) -> dict[str, Any] | None:
         request_id = request.get("id")
         method = request.get("method")
+        is_notification = "id" not in request
+        if not isinstance(method, str):
+            return None if is_notification else _error(request_id, -32600, "Invalid Request")
+        if is_notification:
+            if method == "notifications/initialized" and self._state is GatewayState.INITIALIZED:
+                self._state = GatewayState.ACTIVE
+            elif method == "notifications/cancelled":
+                self._cancel_upstream(request.get("params", {}))
+            return None
+        if method == "initialize":
+            return self._initialize_upstream(request_id, request.get("params", {}))
+        if self._state is GatewayState.CREATED:
+            return _error(request_id, -32002, "Client not initialized")
         try:
-            if method == "initialize":
-                return _result(
-                    request_id,
-                    {
-                        "protocolVersion": "2025-06-18",
-                        "serverInfo": {
-                            "name": "token-governance-mcp-gateway",
-                            "version": "0.1.0",
-                        },
-                        "capabilities": {"tools": {}},
-                    },
-                )
+            if self._state is not GatewayState.ACTIVE:
+                return _error(request_id, -32002, "Client not initialized")
             if method == "tools/list":
                 return _result(request_id, {"tools": gateway_tool_definitions()})
             if method == "tools/call":
+                self._upstream_pending[request_id] = ("", 0)
+                self._current_upstream.request_id = request_id
                 return _result(request_id, self._call_tool(request.get("params", {})))
             return _error(request_id, -32601, f"Method not found: {method}")
         except Exception as exc:
-            return _error(request_id, -32000, str(exc))
+            return _error(request_id, -32000, _redact(str(exc)))
+        finally:
+            self._upstream_pending.pop(request_id, None)
+            self._current_upstream.request_id = None
+
+    def _initialize_upstream(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        if self._state is not GatewayState.CREATED:
+            return _error(request_id, -32600, "Client is already initialized")
+        if not isinstance(params, dict):
+            return _error(request_id, -32602, "initialize params must be an object")
+        failures: dict[str, str] = {}
+        for name, backend in self.backends.items():
+            try:
+                backend.initialize()
+            except Exception as exc:
+                failures[name] = _redact(str(exc))
+        self._state = GatewayState.INITIALIZED
+        result: dict[str, Any] = {
+            "protocolVersion": "2025-06-18",
+            "serverInfo": {"name": "token-governance-mcp-gateway", "version": "0.2.0"},
+            "capabilities": {"tools": {}},
+        }
+        if failures:
+            result["backendStatus"] = {name: self.backends[name].state.value.lower() for name in self.backends}
+            result["unavailableBackends"] = failures
+        return _result(request_id, result)
+
+    def _cancel_upstream(self, params: dict[str, Any]) -> None:
+        request_id = params.get("requestId") if isinstance(params, dict) else None
+        pending = self._upstream_pending.get(request_id)
+        if pending and pending[1]:
+            reason = params.get("reason", "upstream cancellation") if isinstance(params, dict) else "upstream cancellation"
+            self.backends[pending[0]].cancel(pending[1], str(reason))
+
+    def _on_backend_notification(self, backend_name: str, message: dict[str, Any]) -> None:
+        if message.get("method") == "notifications/tools/list_changed":
+            self._tools.pop(backend_name, None)
+
+    def close(self) -> None:
+        if self._state in {GatewayState.CLOSING, GatewayState.CLOSED}:
+            return
+        self._state = GatewayState.CLOSING
+        for backend in self.backends.values():
+            backend.close()
+        self._state = GatewayState.CLOSED
 
     def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
@@ -271,9 +582,13 @@ class McpGateway:
             query = arguments.get("query")
             if query is not None and not isinstance(query, str):
                 raise TypeError("list_backend_tools.query must be a string.")
+            payload: dict[str, Any] = {"tools": self._tool_catalog(query=query)}
+            unavailable = self._unavailable_backends()
+            if unavailable:
+                payload["unavailable_backends"] = unavailable
             return _text_result(
                 json.dumps(
-                    {"tools": self._tool_catalog(query=query)},
+                    payload,
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -294,9 +609,13 @@ class McpGateway:
             if not isinstance(tool_args, dict):
                 raise TypeError("invoke_tool.arguments must be an object.")
             backend_name, schema = self._find_tool(tool_name)
+            upstream_id = getattr(self._current_upstream, "request_id", None)
             return self.backends[backend_name].request(
                 "tools/call",
                 {"name": str(schema["name"]), "arguments": tool_args},
+                request_id_observer=lambda backend_id: self._upstream_pending.__setitem__(
+                    upstream_id, (backend_name, backend_id)
+                ),
             )
         if name == "retrieve_original":
             return _text_result(self.ledger.retrieve_original(str(arguments["receipt_id"])))
@@ -317,8 +636,11 @@ class McpGateway:
         raise KeyError(f"Unknown gateway tool: {name}")
 
     def _backend_tools(self, backend_name: str) -> list[dict[str, Any]]:
+        backend = self.backends[backend_name]
+        if backend.state is not BackendState.ACTIVE:
+            return []
         if backend_name not in self._tools:
-            result = self.backends[backend_name].request("tools/list")
+            result = backend.request("tools/list")
             tools = result.get("tools", [])
             if not isinstance(tools, list):
                 raise TypeError("Backend tools/list result must contain a tools array.")
@@ -344,11 +666,24 @@ class McpGateway:
                 catalog.append(catalog_item)
         return catalog
 
+    def _unavailable_backends(self) -> list[dict[str, str]]:
+        return [
+            {
+                "backend": name,
+                "state": backend.state.value.lower(),
+                "reason": backend.failure_reason or "backend unavailable",
+            }
+            for name, backend in self.backends.items()
+            if backend.state is not BackendState.ACTIVE
+        ]
+
     def _find_tool(self, tool_name: str) -> tuple[str, dict[str, Any]]:
         if "::" in tool_name:
             backend_name, raw_name = tool_name.split("::", 1)
             if backend_name not in self.backends:
                 raise KeyError(f"Backend not found: {backend_name}")
+            if self.backends[backend_name].state is not BackendState.ACTIVE:
+                raise RuntimeError(f"Backend unavailable: {backend_name}")
             for tool in self._backend_tools(backend_name):
                 if tool.get("name") == raw_name:
                     self.tool_policy.assert_allowed(self._qualified_name(backend_name, raw_name))
@@ -504,6 +839,31 @@ def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
         "id": request_id,
         "error": {"code": code, "message": message},
     }
+
+
+_REDACTION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\b(?:gh[opurs]|github_pat|sk|glpat|xox[baprs]|hf|npm)_[A-Za-z0-9_-]{8,255}\b",
+        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+        r"\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization)"
+        r"[\"']?[ \t]{0,32}[:=][ \t]{0,32}[\"']?(?:bearer|basic)?[ \t]*[^\s,;\"']{1,512}",
+        r"-----BEGIN (?:[A-Z0-9 ]{1,64} )?PRIVATE KEY-----.*?-----END [^-]+-----",
+    )
+)
+
+
+def _redact(value: str) -> str:
+    if not isinstance(value, str):
+        return "[REDACTED]"
+    result = value
+    for pattern in _REDACTION_PATTERNS:
+        result = pattern.sub("[REDACTED]", result)
+    return result
+
+
+def _redact_bytes(value: bytes) -> bytes:
+    return _redact(value.decode("utf-8", errors="replace")).encode("utf-8")
 
 
 if __name__ == "__main__":

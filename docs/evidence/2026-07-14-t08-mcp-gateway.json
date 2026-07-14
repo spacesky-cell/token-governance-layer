@@ -1,0 +1,36 @@
+{
+  "ticket": "T08",
+  "terminal_state": "A",
+  "protocol_version": "2025-06-18",
+  "red": {
+    "command": "python -m pytest -q tests/test_mcp_gateway.py",
+    "result": "1 failed, 17 passed",
+    "failure_category": "timeout fixture blocked its own cancellation reader"
+  },
+  "green": {
+    "focused": {
+      "command": "python -m pytest -q tests/test_mcp_gateway.py",
+      "result": "20 passed in 8.15s"
+    },
+    "full": {
+      "command": "python -m pytest -q",
+      "result": "536 passed, 3 skipped in 58.38s"
+    },
+    "static": {
+      "command": "python -m ruff check src/token_governance/mcp_gateway.py tests/test_mcp_gateway.py tests/fixtures/strict_mcp_backend.py",
+      "result": "All checks passed"
+    },
+    "compile": {
+      "command": "python -m compileall -q src tests/fixtures/strict_mcp_backend.py",
+      "result": "passed"
+    },
+    "diff": {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    "privacy": {
+      "scope": "backend stderr ring, gateway client errors/stdout, ledger, evidence",
+      "result": "synthetic credential absent; stderr retained only a redaction marker"
+    }
+  }
+}

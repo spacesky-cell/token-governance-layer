@@ -4,9 +4,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from token_governance.mcp_gateway import BackendState, StdioMcpBackend
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "tests" / "fixtures" / "fake_mcp_backend.py"
+STRICT_BACKEND = ROOT / "tests" / "fixtures" / "strict_mcp_backend.py"
 
 
 def python_env():
@@ -34,12 +39,59 @@ def start_gateway(tmp_path):
     )
 
 
-def send(proc, request):
+def send_raw(proc, request):
     assert proc.stdin is not None
     assert proc.stdout is not None
     proc.stdin.write(json.dumps(request) + "\n")
     proc.stdin.flush()
     return json.loads(proc.stdout.readline())
+
+
+def send(proc, request):
+    if not getattr(proc, "_tgl_active", False) and request.get("method") != "initialize":
+        initialized = send_raw(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": "test-initialize",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                    "capabilities": {},
+                },
+            },
+        )
+        assert initialized["result"]["protocolVersion"] == "2025-06-18"
+        proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        )
+        proc.stdin.flush()
+        proc._tgl_active = True
+    return send_raw(proc, request)
+
+
+def test_gateway_requires_initialize_and_keeps_notifications_silent(tmp_path):
+    proc = start_gateway(tmp_path)
+    try:
+        response = send_raw(
+            proc,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert response["error"] == {"code": -32002, "message": "Client not initialized"}
+        proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled"}) + "\n"
+        )
+        proc.stdin.flush()
+        initialized = send(
+            proc,
+            {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}},
+        )
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+    assert initialized["result"]["capabilities"] == {"tools": {}}
 
 
 def test_gateway_exposes_compact_tool_surface(tmp_path):
@@ -574,3 +626,203 @@ def test_gateway_list_backend_tools_query_filters_catalog(tmp_path):
 
     catalog = json.loads(response["result"]["content"][0]["text"])
     assert [tool["qualified_name"] for tool in catalog["tools"]] == ["backend::search_code"]
+
+
+def test_backend_uses_own_identity_and_interleaved_notification_is_not_response(tmp_path):
+    events = tmp_path / "events.jsonl"
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--mode", "interleaved", "--events", str(events)],
+        timeout_seconds=2,
+    )
+    try:
+        backend.initialize()
+        result = backend.request("tools/list")
+    finally:
+        backend.close()
+
+    recorded = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    assert recorded[0]["method"] == "initialize"
+    assert recorded[0]["params"]["clientInfo"] == {
+        "name": "token-governance-mcp-gateway",
+        "version": "0.2.0",
+    }
+    assert recorded[0]["params"]["capabilities"] == {}
+    assert recorded[1]["method"] == "notifications/initialized"
+    assert recorded[2]["method"] == "tools/list"
+    assert result["tools"][0]["name"] == "echo"
+    assert backend.capabilities == {"tools": {"listChanged": True}}
+    assert backend.state is BackendState.CLOSED
+
+
+def test_incompatible_backend_is_closed_without_blocking_healthy_backend(tmp_path):
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "token_governance.mcp_gateway",
+            "--db",
+            str(tmp_path / "partial.sqlite"),
+            "--backend",
+            f"healthy={sys.executable},{STRICT_BACKEND}",
+            "--backend",
+            f"old={sys.executable},{STRICT_BACKEND},--mode,incompatible",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=python_env(),
+    )
+    try:
+        initialized = send_raw(
+            proc,
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        )
+        proc.stdin.flush()
+        catalog_response = send_raw(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "list_backend_tools", "arguments": {}},
+            },
+        )
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=7)
+
+    assert initialized["result"]["backendStatus"]["healthy"] == "active"
+    assert initialized["result"]["backendStatus"]["old"] == "closed"
+    catalog = json.loads(catalog_response["result"]["content"][0]["text"])
+    assert [item["qualified_name"] for item in catalog["tools"]] == ["healthy::echo"]
+    assert catalog["unavailable_backends"][0]["backend"] == "old"
+
+
+def test_timeout_forwards_cancellation_with_backend_request_id(tmp_path):
+    events = tmp_path / "timeout-events.jsonl"
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--mode", "timeout", "--events", str(events)],
+        timeout_seconds=1,
+    )
+    try:
+        backend.initialize()
+        with pytest.raises(TimeoutError, match="timed out"):
+            backend.request("tools/call", {"name": "echo", "arguments": {}})
+    finally:
+        backend.close()
+
+    recorded = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    call = next(item for item in recorded if item.get("method") == "tools/call")
+    cancelled = next(item for item in recorded if item.get("method") == "notifications/cancelled")
+    assert cancelled["params"]["requestId"] == call["id"]
+
+
+def test_stderr_flood_is_drained_bounded_and_secret_redacted():
+    secret = "ghp_" + "S" * 40
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--mode", "stderr-flood"],
+        timeout_seconds=5,
+    )
+    try:
+        backend.initialize()
+        result = backend.request("tools/call", {"name": "echo", "arguments": {}})
+    finally:
+        backend.close()
+
+    assert result["content"][0]["text"] == "backend result"
+    assert len(backend.stderr_ring.encode("utf-8")) <= 64 * 1024
+    assert secret not in backend.stderr_ring
+    assert "[REDACTED]" in backend.stderr_ring
+
+
+def test_backend_tool_error_result_is_forwarded_unchanged():
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--mode", "tool-error"],
+        timeout_seconds=2,
+    )
+    try:
+        backend.initialize()
+        result = backend.request("tools/call", {"name": "echo", "arguments": {}})
+    finally:
+        backend.close()
+
+    assert result == {
+        "content": [{"type": "text", "text": "backend result"}],
+        "isError": True,
+    }
+
+
+def test_tools_list_changed_invalidates_only_that_backend_catalog(tmp_path):
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "token_governance.mcp_gateway",
+            "--db",
+            str(tmp_path / "list-change.sqlite"),
+            "--backend",
+            f"changing={sys.executable},{STRICT_BACKEND},--mode,list-change",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=python_env(),
+    )
+    request = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "list_backend_tools", "arguments": {}},
+    }
+    try:
+        first = send(proc, {**request, "id": 1})
+        second = send(proc, {**request, "id": 2})
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+    first_catalog = json.loads(first["result"]["content"][0]["text"])
+    second_catalog = json.loads(second["result"]["content"][0]["text"])
+    assert first_catalog["tools"][0]["description"].endswith("generation=0")
+    assert second_catalog["tools"][0]["description"].endswith("generation=1")
+
+
+def test_shutdown_escalates_from_wait_to_terminate_then_kill():
+    calls = []
+
+    class Stdin:
+        def close(self):
+            calls.append("close-stdin")
+
+    class Process:
+        stdin = Stdin()
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            if calls.count(("wait", 2)) < 3:
+                raise subprocess.TimeoutExpired("fixture", timeout)
+            return 0
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+    backend = StdioMcpBackend(["unused"])
+    backend.proc = Process()
+    backend.close()
+
+    assert calls == [
+        "close-stdin",
+        ("wait", 2),
+        "terminate",
+        ("wait", 2),
+        "kill",
+        ("wait", 2),
+    ]
+    assert backend.state is BackendState.CLOSED
