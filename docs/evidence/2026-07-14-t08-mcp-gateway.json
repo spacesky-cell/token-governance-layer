@@ -7,6 +7,24 @@
     "result": "1 failed, 17 passed",
     "failure_category": "timeout fixture blocked its own cancellation reader"
   },
+  "review_fix": {
+    "red": {
+      "command": "python -m pytest -q tests/test_mcp_gateway.py -k 'private_key or before_backend_id or serializes or before_initialize or start_failure'",
+      "result": "5 failed, 20 deselected",
+      "failure_categories": [
+        "multiline PEM disclosure",
+        "cancellation-before-binding race",
+        "concurrent JSON-RPC frame interleaving",
+        "request accepted before backend initialize",
+        "Popen failure left backend STARTING"
+      ]
+    },
+    "green": {
+      "targeted": "5 passed, 20 deselected in 0.58s",
+      "focused": "28 passed in 10.24s",
+      "full": "544 passed, 3 skipped in 60.85s"
+    }
+  },
   "green": {
     "focused": {
       "command": "python -m pytest -q tests/test_mcp_gateway.py",

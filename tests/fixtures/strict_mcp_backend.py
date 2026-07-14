@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 
@@ -67,8 +68,29 @@ def main() -> None:
                 continue
             if args.mode == "stderr-flood":
                 secret = "ghp_" + "S" * 40
-                sys.stderr.write(("noise\n" * 20000) + f"token={secret}\n")
+                private_key = "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----"
+                sys.stderr.write(("noise\n" * 20000) + f"token={secret}\n{private_key}\n")
                 sys.stderr.flush()
+            if args.mode == "pem-chunked":
+                for chunk in (
+                    "-----BEGIN PRIVATE KEY-----\n",
+                    "chunked-private-material\n",
+                    "-----END PRIVATE KEY-----\n",
+                ):
+                    sys.stderr.write(chunk)
+                    sys.stderr.flush()
+                    time.sleep(0.05)
+            if args.mode == "error-secret":
+                secret = "ghp_" + "E" * 40
+                private_key = "-----BEGIN PRIVATE KEY-----\nerror-private-material\n-----END PRIVATE KEY-----"
+                emit(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32001, "message": f"token={secret} {private_key}"},
+                    }
+                )
+                continue
             emit(
                 {
                     "jsonrpc": "2.0",

@@ -225,6 +225,7 @@ class StdioMcpBackend:
         self.failure_reason: str | None = None
         self._pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._stderr = deque()  # type: deque[bytes]
         self._stderr_size = 0
         self._reader: threading.Thread | None = None
@@ -252,8 +253,8 @@ class StdioMcpBackend:
         self._stderr_reader.start()
 
     def initialize(self) -> None:
-        self.start()
         try:
+            self.start()
             result = self.request("initialize", {
                 "protocolVersion": self.PROTOCOL_VERSION,
                 "clientInfo": {"name": "token-governance-mcp-gateway", "version": "0.2.0"},
@@ -279,7 +280,9 @@ class StdioMcpBackend:
 
     def request(self, method: str, params: dict[str, Any] | None = None,
                 *, request_id_observer: Any | None = None) -> dict[str, Any]:
-        if self.state in {BackendState.CLOSING, BackendState.CLOSED, BackendState.FAILED}:
+        if method == "initialize" and self.state is not BackendState.STARTING:
+            raise RuntimeError(f"Backend {self.name} is unavailable ({self.state.value.lower()})")
+        if method != "initialize" and self.state is not BackendState.ACTIVE:
             raise RuntimeError(f"Backend {self.name} is unavailable ({self.state.value.lower()})")
         if self.proc is None or self.proc.stdin is None:
             raise RuntimeError("Backend MCP process has no stdio pipes.")
@@ -289,8 +292,6 @@ class StdioMcpBackend:
             event = threading.Event()
             slot: dict[str, Any] = {}
             self._pending[request_id] = (event, slot)
-        if request_id_observer is not None:
-            request_id_observer(request_id)
         request = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -299,6 +300,8 @@ class StdioMcpBackend:
         }
         try:
             self._write(request)
+            if request_id_observer is not None:
+                request_id_observer(request_id)
             if not event.wait(self.timeout_seconds):
                 self.cancel(request_id)
                 raise TimeoutError(f"Backend {self.name} request timed out")
@@ -333,11 +336,12 @@ class StdioMcpBackend:
         if proc is None or proc.stdin is None:
             raise RuntimeError(f"Backend {self.name} has no stdin")
         raw = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-        try:
-            proc.stdin.write(raw)
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
-            raise RuntimeError(f"Backend {self.name} transport failed") from exc
+        with self._write_lock:
+            try:
+                proc.stdin.write(raw)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise RuntimeError(f"Backend {self.name} transport failed") from exc
 
     def _read_stdout(self) -> None:
         proc = self.proc
@@ -378,19 +382,36 @@ class StdioMcpBackend:
         if proc is None or proc.stderr is None:
             return
         carry = b""
+        private_key_open = False
         while True:
             chunk = proc.stderr.read(4096)
             if not chunk:
                 break
             carry += chunk
-            newline = carry.rfind(b"\n")
-            if newline >= 0:
-                self._append_stderr(carry[: newline + 1])
-                carry = carry[newline + 1 :]
-            elif len(carry) > 4096:
+            while b"\n" in carry:
+                line, carry = carry.split(b"\n", 1)
+                line += b"\n"
+                if private_key_open:
+                    if re.search(br"-----END (?:[A-Z0-9 ]{1,64} )?PRIVATE KEY-----", line, re.IGNORECASE):
+                        private_key_open = False
+                        self._append_stderr(b"[REDACTED]\n")
+                    continue
+                begin = re.search(br"-----BEGIN (?:[A-Z0-9 ]{1,64} )?PRIVATE KEY-----", line, re.IGNORECASE)
+                if begin is not None:
+                    private_key_open = True
+                    if begin.start() > 0:
+                        self._append_stderr(line[: begin.start()])
+                    if re.search(br"-----END (?:[A-Z0-9 ]{1,64} )?PRIVATE KEY-----", line[begin.end() :], re.IGNORECASE):
+                        private_key_open = False
+                        self._append_stderr(b"[REDACTED]\n")
+                    continue
+                self._append_stderr(line)
+            if len(carry) > 4096 and not private_key_open:
                 self._append_stderr(carry[:-1024])
                 carry = carry[-1024:]
-        if carry:
+        if private_key_open:
+            self._append_stderr(b"[REDACTED]")
+        elif carry:
             self._append_stderr(carry)
 
     def _append_stderr(self, value: bytes) -> None:
@@ -414,11 +435,12 @@ class StdioMcpBackend:
             self.state = BackendState.CLOSED
             return
         self.state = BackendState.CLOSING
-        if proc.stdin is not None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
+        with self._write_lock:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -462,6 +484,8 @@ class McpGateway:
         self._current_upstream = threading.local()
         self._output_lock = threading.Lock()
         self._workers: set[threading.Thread] = set()
+        self._pending_lock = threading.Lock()
+        self._cancelled_pending: dict[Any, str] = {}
 
     def run(self, stdin: Any, stdout: Any) -> int:
         for line in stdin:
@@ -524,14 +548,17 @@ class McpGateway:
             if method == "tools/list":
                 return _result(request_id, {"tools": gateway_tool_definitions()})
             if method == "tools/call":
-                self._upstream_pending[request_id] = ("", 0)
+                with self._pending_lock:
+                    self._upstream_pending[request_id] = ("", 0)
                 self._current_upstream.request_id = request_id
                 return _result(request_id, self._call_tool(request.get("params", {})))
             return _error(request_id, -32601, f"Method not found: {method}")
         except Exception as exc:
             return _error(request_id, -32000, _redact(str(exc)))
         finally:
-            self._upstream_pending.pop(request_id, None)
+            with self._pending_lock:
+                self._upstream_pending.pop(request_id, None)
+                self._cancelled_pending.pop(request_id, None)
             self._current_upstream.request_id = None
 
     def _initialize_upstream(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -553,15 +580,38 @@ class McpGateway:
         }
         if failures:
             result["backendStatus"] = {name: self.backends[name].state.value.lower() for name in self.backends}
-            result["unavailableBackends"] = failures
+            result["unavailableBackends"] = [
+                {
+                    "backend": name,
+                    "state": self.backends[name].state.value.lower(),
+                    "reason": reason,
+                }
+                for name, reason in failures.items()
+            ]
         return _result(request_id, result)
 
     def _cancel_upstream(self, params: dict[str, Any]) -> None:
         request_id = params.get("requestId") if isinstance(params, dict) else None
-        pending = self._upstream_pending.get(request_id)
+        reason = params.get("reason", "upstream cancellation") if isinstance(params, dict) else "upstream cancellation"
+        with self._pending_lock:
+            pending = self._upstream_pending.get(request_id)
+            if not pending:
+                return
+            if not pending[1]:
+                self._cancelled_pending[request_id] = str(reason)
+                return
         if pending and pending[1]:
-            reason = params.get("reason", "upstream cancellation") if isinstance(params, dict) else "upstream cancellation"
             self.backends[pending[0]].cancel(pending[1], str(reason))
+
+    def _bind_backend_request(self, upstream_id: Any, backend_name: str, backend_id: int) -> None:
+        with self._pending_lock:
+            pending = self._upstream_pending.get(upstream_id)
+            if pending is None:
+                return
+            self._upstream_pending[upstream_id] = (backend_name, backend_id)
+            reason = self._cancelled_pending.pop(upstream_id, None)
+        if reason is not None:
+            self.backends[backend_name].cancel(backend_id, reason)
 
     def _on_backend_notification(self, backend_name: str, message: dict[str, Any]) -> None:
         if message.get("method") == "notifications/tools/list_changed":
@@ -613,8 +663,8 @@ class McpGateway:
             return self.backends[backend_name].request(
                 "tools/call",
                 {"name": str(schema["name"]), "arguments": tool_args},
-                request_id_observer=lambda backend_id: self._upstream_pending.__setitem__(
-                    upstream_id, (backend_name, backend_id)
+                request_id_observer=lambda backend_id: self._bind_backend_request(
+                    upstream_id, backend_name, backend_id
                 ),
             )
         if name == "retrieve_original":
@@ -848,7 +898,7 @@ _REDACTION_PATTERNS = tuple(
         r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
         r"\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization)"
         r"[\"']?[ \t]{0,32}[:=][ \t]{0,32}[\"']?(?:bearer|basic)?[ \t]*[^\s,;\"']{1,512}",
-        r"-----BEGIN (?:[A-Z0-9 ]{1,64} )?PRIVATE KEY-----.*?-----END [^-]+-----",
+        r"(?s)-----BEGIN (?:[A-Z0-9 ]{1,64} )?PRIVATE KEY-----.{0,65536}?-----END (?:[A-Z0-9 ]{1,64} )?PRIVATE KEY-----",
     )
 )
 

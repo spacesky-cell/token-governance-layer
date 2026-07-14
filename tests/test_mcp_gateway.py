@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from token_governance.mcp_gateway import BackendState, StdioMcpBackend
+from token_governance.mcp_gateway import (
+    BackendState,
+    McpGateway,
+    StdioMcpBackend,
+    _redact,
+)
+from token_governance.ledger import ContextLedger
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -736,6 +742,8 @@ def test_stderr_flood_is_drained_bounded_and_secret_redacted():
     assert result["content"][0]["text"] == "backend result"
     assert len(backend.stderr_ring.encode("utf-8")) <= 64 * 1024
     assert secret not in backend.stderr_ring
+    assert "-----BEGIN PRIVATE KEY-----" not in backend.stderr_ring
+    assert "private-material" not in backend.stderr_ring
     assert "[REDACTED]" in backend.stderr_ring
 
 
@@ -754,6 +762,39 @@ def test_backend_tool_error_result_is_forwarded_unchanged():
         "content": [{"type": "text", "text": "backend result"}],
         "isError": True,
     }
+
+
+def test_backend_protocol_error_is_secret_redacted():
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--mode", "error-secret"],
+        timeout_seconds=2,
+    )
+    try:
+        backend.initialize()
+        with pytest.raises(RuntimeError) as caught:
+            backend.request("tools/call", {"name": "echo", "arguments": {}})
+    finally:
+        backend.close()
+
+    message = str(caught.value)
+    assert "ghp_" not in message
+    assert "error-private-material" not in message
+    assert "[REDACTED]" in message
+
+
+def test_chunked_multiline_private_key_is_redacted_from_stderr_ring():
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--mode", "pem-chunked"],
+        timeout_seconds=2,
+    )
+    try:
+        backend.initialize()
+        backend.request("tools/call", {"name": "echo", "arguments": {}})
+    finally:
+        backend.close()
+
+    assert "chunked-private-material" not in backend.stderr_ring
+    assert "-----BEGIN PRIVATE KEY-----" not in backend.stderr_ring
 
 
 def test_tools_list_changed_invalidates_only_that_backend_catalog(tmp_path):
@@ -826,3 +867,148 @@ def test_shutdown_escalates_from_wait_to_terminate_then_kill():
         ("wait", 2),
     ]
     assert backend.state is BackendState.CLOSED
+
+
+def test_multiline_private_key_is_redacted_from_all_diagnostic_text():
+    private_key = "-----BEGIN PRIVATE KEY-----\n" + ("very-secret-material\n" * 4) + "-----END PRIVATE KEY-----"
+    diagnostic = f"prefix token=ghp_{'X' * 40}\n{private_key}\nsuffix"
+    redacted = _redact(diagnostic)
+    assert private_key not in redacted
+    assert "very-secret-material" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_cancellation_before_backend_id_binding_is_forwarded_after_binding(tmp_path):
+    events = tmp_path / "cancel-before-bind.jsonl"
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--events", str(events)],
+        timeout_seconds=2,
+    )
+    gateway = McpGateway(ContextLedger(tmp_path / "cancel.sqlite"), {"backend": backend})
+    gateway._upstream_pending[91] = ("", 0)
+    entered = __import__("threading").Event()
+    release = __import__("threading").Event()
+    original_request = backend.request
+
+    def delayed_request(method, params=None, *, request_id_observer=None):
+        def delayed_observer(backend_id):
+            entered.set()
+            release.wait(timeout=2)
+            request_id_observer(backend_id)
+
+        return original_request(method, params, request_id_observer=delayed_observer)
+
+    backend.initialize()
+    try:
+        import threading
+
+        worker = threading.Thread(
+            target=lambda: delayed_request(
+                "tools/call",
+                {"name": "echo", "arguments": {}},
+                request_id_observer=lambda backend_id: gateway._bind_backend_request(
+                    91, "backend", backend_id
+                ),
+            )
+        )
+        worker.start()
+        assert entered.wait(timeout=2)
+        gateway._cancel_upstream({"requestId": 91, "reason": "user cancelled"})
+        release.set()
+        worker.join(timeout=3)
+    finally:
+        backend.close()
+
+    recorded = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    cancelled = next(item for item in recorded if item.get("method") == "notifications/cancelled")
+    call = next(item for item in recorded if item.get("method") == "tools/call")
+    assert cancelled["params"]["requestId"] == call["id"]
+
+
+def test_backend_write_serializes_complete_json_rpc_frames():
+    import threading
+    import time
+
+    class Stdin:
+        def __init__(self):
+            self.data = bytearray()
+
+        def write(self, value):
+            half = max(1, len(value) // 2)
+            self.data.extend(value[:half])
+            time.sleep(0.001)
+            self.data.extend(value[half:])
+
+        def flush(self):
+            return None
+
+    class Process:
+        stdin = Stdin()
+
+    backend = StdioMcpBackend(["unused"])
+    backend.proc = Process()
+    threads = [
+        threading.Thread(target=backend._write, args=({"jsonrpc": "2.0", "id": index, "method": "x"},))
+        for index in range(10)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    frames = [json.loads(frame) for frame in bytes(backend.proc.stdin.data).splitlines()]
+    assert {frame["id"] for frame in frames} == set(range(10))
+
+
+def test_backend_request_before_initialize_is_unavailable_and_repeated_initialize_rejected(tmp_path):
+    backend = StdioMcpBackend([sys.executable, str(STRICT_BACKEND)], timeout_seconds=2)
+    backend.start()
+    with pytest.raises(RuntimeError, match="starting"):
+        backend.request("tools/list")
+    backend.initialize()
+    with pytest.raises(RuntimeError, match="already initialized|unavailable"):
+        backend.request("initialize")
+    backend.close()
+
+
+def test_backend_start_failure_is_closed_with_structured_reason(tmp_path):
+    backend = StdioMcpBackend([str(tmp_path / "does-not-exist")])
+    with pytest.raises((FileNotFoundError, RuntimeError)):
+        backend.initialize()
+    assert backend.state is BackendState.CLOSED
+    assert backend.failure_reason
+
+
+def test_gateway_start_failure_is_structured_unavailable(tmp_path):
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "token_governance.mcp_gateway",
+            "--db",
+            str(tmp_path / "start-failure.sqlite"),
+            "--backend",
+            f"healthy={sys.executable},{STRICT_BACKEND}",
+            "--backend",
+            f"missing={tmp_path / 'not-a-command'}",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=python_env(),
+    )
+    try:
+        initialized = send_raw(
+            proc,
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+    assert initialized["result"]["backendStatus"]["missing"] == "closed"
+    unavailable = next(
+        item for item in initialized["result"]["unavailableBackends"] if item["backend"] == "missing"
+    )
+    assert unavailable["state"] == "closed"
+    assert unavailable["reason"]
