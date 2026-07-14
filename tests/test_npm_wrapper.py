@@ -64,17 +64,11 @@ def test_npm_tgl_wrapper_govern_retrieve_roundtrip(tmp_path):
     assert retrieve.stdout == payload
 
 
-def test_npm_tgl_wrapper_claude_install_uses_npm_bin_commands(tmp_path):
+def test_source_npm_wrapper_rejects_persistent_install_without_mutation(tmp_path):
     project_path = tmp_path / "project"
 
     result = run_node_bin("tgl.js", ["claude-install", "--project", str(project_path)])
 
-    assert result.returncode == 0, result.stderr
-    settings = json.loads((project_path / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    hook_command = settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-    assert hook_command.startswith('"tgl-claude-hook" --db ')
-
-    mcp_config = json.loads((project_path / ".mcp.json").read_text(encoding="utf-8"))
-    server = mcp_config["mcpServers"]["token-governance-layer"]
-    assert server["command"] == "tgl-mcp"
-    assert server["args"][0] == "--db"
+    assert result.returncode == 2
+    assert "npm install -g token-governance-layer" in result.stderr
+    assert not project_path.exists()

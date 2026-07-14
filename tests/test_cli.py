@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -7,9 +8,14 @@ from pathlib import Path
 import pytest
 
 
-def run_cli(args, input_text=None):
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run_cli(args, input_text=None, *, env_overrides=None):
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = str(ROOT / "src")
+    if env_overrides:
+        env.update(env_overrides)
     return subprocess.run(
         [sys.executable, "-m", "token_governance.cli", *args],
         input=input_text,
@@ -18,6 +24,34 @@ def run_cli(args, input_text=None):
         check=False,
         env=env,
     )
+
+
+def fake_global_install_env(tmp_path):
+    prefix = tmp_path / "全局 npm with spaces"
+    if os.name == "nt":
+        package_root = prefix / "node_modules" / "token-governance-layer"
+        shim_dir = prefix
+    else:
+        package_root = prefix / "lib" / "node_modules" / "token-governance-layer"
+        shim_dir = prefix / "bin"
+    shutil.copytree(ROOT / "src", package_root / "src")
+    shutil.copy2(ROOT / "package.json", package_root / "package.json")
+    shutil.copytree(ROOT / "bin", package_root / "bin")
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    for name, script in (
+        ("tgl-claude-hook", "tgl-claude-hook.js"),
+        ("tgl-mcp", "tgl-mcp.js"),
+    ):
+        if os.name == "nt":
+            (shim_dir / f"{name}.CMD").write_text("@echo off\n", encoding="utf-8")
+        else:
+            shim = shim_dir / name
+            shim.symlink_to(package_root / "bin" / script)
+    return {
+        "PYTHONPATH": str(package_root / "src"),
+        "TGL_NPM_WRAPPER": "1",
+        "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", ""),
+    }
 
 
 def test_cli_govern_and_retrieve_roundtrip(tmp_path):
@@ -229,114 +263,93 @@ def test_cli_generates_source_checkout_gateway_mcp_config(tmp_path):
     assert server["env"]["PYTHONPATH"] == str(source_root / "src")
 
 
-def test_cli_claude_install_writes_project_hook_and_mcp_config(tmp_path):
-    project_path = tmp_path / "project"
-    db_path = project_path / ".tgl" / "claude-ledger.sqlite"
-    hook_command = tmp_path / "bin" / "tgl-claude-hook.exe"
-    mcp_command = tmp_path / "bin" / "tgl-mcp.exe"
+def test_cli_init_creates_config_once_without_overwriting_user_values(tmp_path):
+    project = tmp_path / "项目 with spaces"
 
-    result = run_cli(
-        [
-            "--db",
-            str(db_path),
-            "claude-install",
-            "--project",
-            str(project_path),
-            "--hook-command",
-            str(hook_command),
-            "--mcp-command",
-            str(mcp_command),
-        ]
-    )
-
-    assert result.returncode == 0, result.stderr
-    report = json.loads(result.stdout)
-    assert report["ok"] is True
-
-    settings = json.loads((project_path / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    post_tool_use = settings["hooks"]["PostToolUse"]
-    assert len(post_tool_use) == 1
-    hook = post_tool_use[0]
-    assert hook["matcher"] == "Bash|PowerShell|Read|Grep|Glob|LS|Task|WebFetch|WebSearch"
-    command = hook["hooks"][0]["command"]
-    assert "tgl-claude-hook.exe" in command
-    assert "--db" in command
-    assert "\\" not in command
-    assert str(db_path).replace("\\", "/") in command
-
-    mcp_config = json.loads((project_path / ".mcp.json").read_text(encoding="utf-8"))
-    server = mcp_config["mcpServers"]["token-governance-layer"]
-    assert server["type"] == "stdio"
-    assert server["command"] == str(mcp_command).replace("\\", "/")
-    assert server["args"] == ["--db", str(db_path).replace("\\", "/")]
-    assert server["env"] == {}
-
-
-def test_cli_claude_install_preserves_existing_hooks_and_is_idempotent(tmp_path):
-    project_path = tmp_path / "project"
-    settings_path = project_path / ".claude" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    settings_path.write_text(
-        json.dumps(
-            {
-                "hooks": {
-                    "PostToolUse": [
-                        {
-                            "matcher": "Read",
-                            "hooks": [
-                                {
-                                    "type": "command",
-                                    "command": "existing-audit-hook",
-                                }
-                            ],
-                        },
-                        {
-                            "matcher": "Bash",
-                            "hooks": [
-                                {
-                                    "type": "command",
-                                    "command": "old-tgl-claude-hook --db old.sqlite",
-                                }
-                            ],
-                        },
-                    ]
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    (project_path / ".mcp.json").write_text(
-        json.dumps({"mcpServers": {"existing-server": {"command": "keep-me"}}}),
-        encoding="utf-8",
-    )
-
-    args = [
-        "--db",
-        str(project_path / ".tgl" / "claude-ledger.sqlite"),
-        "claude-install",
-        "--project",
-        str(project_path),
-        "--hook-command",
-        str(tmp_path / "bin" / "tgl-claude-hook.exe"),
-        "--mcp-command",
-        str(tmp_path / "bin" / "tgl-mcp.exe"),
-    ]
-
-    first = run_cli(args)
-    second = run_cli(args)
+    first = run_cli(["init", "--project", str(project)])
+    config_path = project / "token-governance.config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["ledger"]["retention_days"] = 99
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    customized = config_path.read_bytes()
+    second = run_cli(["init", "--project", str(project)])
 
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
+    assert json.loads(first.stdout)["created"] is True
+    assert json.loads(second.stdout)["created"] is False
+    assert config_path.read_bytes() == customized
 
-    settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    commands = [
-        hook["command"]
-        for entry in settings["hooks"]["PostToolUse"]
-        for hook in entry["hooks"]
-    ]
-    assert commands.count("existing-audit-hook") == 1
-    assert sum("tgl-claude-hook" in command for command in commands) == 1
 
-    mcp_config = json.loads((project_path / ".mcp.json").read_text(encoding="utf-8"))
-    assert "existing-server" in mcp_config["mcpServers"]
-    assert "token-governance-layer" in mcp_config["mcpServers"]
+def test_cli_claude_install_rejects_unproven_source_before_project_mutation(tmp_path):
+    project = tmp_path / "project"
+
+    result = run_cli(["claude-install", "--project", str(project)])
+
+    assert result.returncode == 2
+    assert "npm install -g token-governance-layer" in result.stderr
+    assert not project.exists()
+
+
+def test_cli_global_install_supports_unicode_paths_and_full_lifecycle(tmp_path):
+    project = tmp_path / "用户 project with spaces"
+    env = fake_global_install_env(tmp_path)
+
+    installed = run_cli(
+        ["claude-install", "--project", str(project)],
+        env_overrides=env,
+    )
+    before_doctor = {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in project.rglob("*")
+        if path.is_file()
+    }
+    doctor = run_cli(
+        ["doctor", "--project", str(project), "--integration"],
+        env_overrides=env,
+    )
+    after_doctor = {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in project.rglob("*")
+        if path.is_file()
+    }
+    removed = run_cli(
+        ["claude-uninstall", "--project", str(project)],
+        env_overrides=env,
+    )
+
+    assert installed.returncode == 0, installed.stderr
+    assert doctor.returncode == 0, doctor.stderr
+    assert json.loads(doctor.stdout)["ok"] is True
+    assert after_doctor == before_doctor
+    assert removed.returncode == 0, removed.stderr
+    assert (project / "token-governance.config.json").exists()
+    assert not (project / ".tgl" / "install-state.json").exists()
+
+
+def test_cli_incomplete_install_requires_explicit_repair(tmp_path):
+    project = tmp_path / "project"
+    env = fake_global_install_env(tmp_path)
+    installed = run_cli(
+        ["claude-install", "--project", str(project)], env_overrides=env
+    )
+    assert installed.returncode == 0, installed.stderr
+    state = project / ".tgl" / "install-state.json"
+    state.write_text('{"schema_version":1,"status":"incomplete"}\n', encoding="utf-8")
+    before = state.read_bytes()
+
+    refused = run_cli(
+        ["claude-install", "--project", str(project)], env_overrides=env
+    )
+
+    assert refused.returncode == 2
+    assert "--repair" in refused.stderr
+    assert state.read_bytes() == before
+
+    repaired = run_cli(
+        ["claude-install", "--project", str(project), "--repair"],
+        env_overrides=env,
+    )
+
+    assert repaired.returncode == 0, repaired.stderr
+    assert json.loads(state.read_text(encoding="utf-8"))["status"] == "complete"

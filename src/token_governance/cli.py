@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 from dataclasses import asdict, dataclass
@@ -12,6 +11,14 @@ from .config import GovernanceConfig
 from .contracts import GovernanceMode, GovernanceRequest, SourceKind, Strategy
 from .core import create_governance_engine, default_governance_config
 from .ledger import ContextLedger
+from .installer import (
+    InstallError,
+    discover_stable_commands,
+    doctor_project,
+    initialize_project,
+    install_project,
+    uninstall_project,
+)
 from .mcp_gateway import (
     load_config,
     parse_backend_specs,
@@ -20,13 +27,6 @@ from .mcp_gateway import (
 )
 
 DEFAULT_DB_PATH = str(Path.home() / ".token-governance" / "ledger.sqlite")
-DEFAULT_CLAUDE_LEDGER = ".tgl/claude-ledger.sqlite"
-DEFAULT_CLAUDE_HOOK_MATCHER = "Bash|PowerShell|Read|Grep|Glob|LS|Task|WebFetch|WebSearch"
-TGL_HOOK_COMMAND_MARKERS = (
-    "tgl-claude-hook",
-    "token_governance.claude_hook",
-    "claude-tgl-hook",
-)
 GOVERN_MIGRATION_GUIDANCE = (
     "content_type/source were removed; use --strategy "
     "auto|repetitive_log|test_output|build_output"
@@ -68,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("risks", help="Show non-low-risk receipts.")
     doctor = subparsers.add_parser("doctor", help="Check local configuration.")
     doctor.add_argument("--config", help="Path to token-governance.config.json.")
+    doctor.add_argument("--project", help="Project directory to diagnose without writes.")
+    doctor.add_argument(
+        "--integration",
+        action="store_true",
+        help="Run isolated Hook and standalone MCP smoke checks.",
+    )
+
+    init = subparsers.add_parser("init", help="Create project configuration if absent.")
+    init.add_argument("--project", default=".", help="Project directory.")
 
     mcp_config = subparsers.add_parser("mcp-config", help="Generate an MCP config snippet.")
     mcp_config.add_argument("--config", required=True, help="Path to token-governance.config.json.")
@@ -84,18 +93,18 @@ def build_parser() -> argparse.ArgumentParser:
     claude_install.add_argument(
         "--project",
         default=".",
-        help="Project directory where .claude/settings.json and .mcp.json will be updated.",
+        help="Project directory where Claude integration will be installed.",
     )
     claude_install.add_argument(
-        "--hook-command",
-        help="Path or command for tgl-claude-hook. Defaults to the installed console script.",
+        "--repair",
+        action="store_true",
+        help="Explicitly repair an incomplete TGL-owned installation.",
     )
-    claude_install.add_argument(
-        "--mcp-command",
-        help="Path or command for tgl-mcp. Defaults to the installed console script.",
+    claude_uninstall = subparsers.add_parser(
+        "claude-uninstall",
+        help="Remove only project-level TGL-owned Claude integration entries.",
     )
-    claude_install.add_argument("--server-name", default="token-governance-layer")
-    claude_install.add_argument("--matcher", default=DEFAULT_CLAUDE_HOOK_MATCHER)
+    claude_uninstall.add_argument("--project", default=".", help="Project directory.")
     return parser
 
 
@@ -104,20 +113,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     db_path = args.db or DEFAULT_DB_PATH
 
-    if args.command == "claude-install":
+    if args.command in {"init", "claude-install", "claude-uninstall"}:
         try:
-            _print_json(
-                install_claude_project(
-                    project_path=args.project,
-                    db_path=args.db,
-                    hook_command=args.hook_command,
-                    mcp_command=args.mcp_command,
-                    server_name=args.server_name,
-                    matcher=args.matcher,
+            if args.command == "init":
+                report = initialize_project(args.project)
+            elif args.command == "claude-install":
+                commands = discover_stable_commands()
+                report = install_project(
+                    args.project,
+                    commands=commands,
+                    repair=args.repair,
                 )
-            )
+            else:
+                report = uninstall_project(args.project)
+            _print_json(report)
             return 0
-        except ValueError as exc:
+        except (InstallError, OSError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
 
@@ -169,7 +180,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "doctor":
-            report = build_doctor_report(db_path=db_path, config_path=args.config)
+            if args.project is not None or args.integration:
+                report = doctor_project(
+                    args.project or ".",
+                    integration=args.integration,
+                )
+            else:
+                report = build_doctor_report(db_path=db_path, config_path=args.config)
             _print_json(report)
             return 0 if report["ok"] else 1
 
@@ -199,154 +216,6 @@ def _runtime_config(config_path: str | None, db_path: str | None) -> GovernanceC
         return default_governance_config(db_path or DEFAULT_DB_PATH)
     overrides = {"ledger": {"path": db_path}} if db_path is not None else None
     return GovernanceConfig.load(config_path, cli_overrides=overrides)
-
-
-def install_claude_project(
-    *,
-    project_path: str,
-    db_path: str | None,
-    hook_command: str | None,
-    mcp_command: str | None,
-    server_name: str,
-    matcher: str,
-) -> dict[str, object]:
-    project = Path(project_path).expanduser().resolve()
-    ledger_path = _resolve_project_path(project, db_path or DEFAULT_CLAUDE_LEDGER)
-    hook_executable = _resolve_command(hook_command, "tgl-claude-hook")
-    mcp_executable = _resolve_command(mcp_command, "tgl-mcp")
-
-    settings_path = project / ".claude" / "settings.json"
-    mcp_path = project / ".mcp.json"
-
-    settings = _read_json_object(settings_path)
-    mcp_config = _read_json_object(mcp_path)
-
-    hook_command_line = (
-        f"{_quote_for_claude_shell(_config_path(hook_executable))} "
-        f"--db {_quote_for_claude_shell(_config_path(ledger_path))}"
-    )
-    _install_claude_hook(settings, matcher=matcher, command=hook_command_line)
-    _install_mcp_server(
-        mcp_config,
-        server_name=server_name,
-        command=_config_path(mcp_executable),
-        db_path=_config_path(ledger_path),
-    )
-
-    _write_json(settings_path, settings)
-    _write_json(mcp_path, mcp_config)
-
-    return {
-        "ok": True,
-        "project": str(project),
-        "settings": str(settings_path),
-        "mcp": str(mcp_path),
-        "ledger": _config_path(ledger_path),
-        "hook_command": hook_command_line,
-        "mcp_server": server_name,
-    }
-
-
-def _resolve_project_path(project: Path, value: str) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = project / path
-    return path.resolve()
-
-
-def _resolve_command(value: str | None, command_name: str) -> str:
-    if value is None and os.environ.get("TGL_NPM_WRAPPER") == "1":
-        return command_name
-    command = value or shutil.which(command_name) or command_name
-    if any(separator in command for separator in ("\\", "/")):
-        return str(Path(command).expanduser().resolve())
-    return command
-
-
-def _read_json_object(path: Path) -> dict[str, object]:
-    if not path.exists():
-        return {}
-    value = json.loads(path.read_text(encoding="utf-8-sig"))
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected JSON object in {path}")
-    return value
-
-
-def _write_json(path: Path, value: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _install_claude_hook(settings: dict[str, object], *, matcher: str, command: str) -> None:
-    hooks = settings.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
-        raise ValueError("Expected .claude/settings.json hooks to be an object")
-
-    post_tool_use = hooks.get("PostToolUse", [])
-    if not isinstance(post_tool_use, list):
-        raise ValueError("Expected hooks.PostToolUse to be a list")
-
-    kept_entries = []
-    for entry in post_tool_use:
-        if not isinstance(entry, dict):
-            kept_entries.append(entry)
-            continue
-        entry_hooks = entry.get("hooks", [])
-        if not isinstance(entry_hooks, list):
-            kept_entries.append(entry)
-            continue
-        kept_hooks = [
-            hook
-            for hook in entry_hooks
-            if not (isinstance(hook, dict) and _is_tgl_hook_command(hook.get("command")))
-        ]
-        if kept_hooks:
-            copied = dict(entry)
-            copied["hooks"] = kept_hooks
-            kept_entries.append(copied)
-
-    kept_entries.append(
-        {
-            "matcher": matcher,
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command,
-                }
-            ],
-        }
-    )
-    hooks["PostToolUse"] = kept_entries
-
-
-def _is_tgl_hook_command(command: object) -> bool:
-    if not isinstance(command, str):
-        return False
-    lowered = command.lower()
-    return any(marker in lowered for marker in TGL_HOOK_COMMAND_MARKERS)
-
-
-def _install_mcp_server(
-    mcp_config: dict[str, object], *, server_name: str, command: str, db_path: str
-) -> None:
-    servers = mcp_config.setdefault("mcpServers", {})
-    if not isinstance(servers, dict):
-        raise ValueError("Expected .mcp.json mcpServers to be an object")
-    servers[server_name] = {
-        "type": "stdio",
-        "command": command,
-        "args": ["--db", db_path],
-        "env": {},
-    }
-
-
-def _config_path(value: str | Path) -> str:
-    return str(value).replace("\\", "/")
-
-
-def _quote_for_claude_shell(value: str) -> str:
-    escaped = value.replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
-    return f'"{escaped}"'
 
 
 def build_mcp_config_snippet(
