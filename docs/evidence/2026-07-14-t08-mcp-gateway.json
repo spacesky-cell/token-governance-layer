@@ -25,14 +25,30 @@
       "full": "544 passed, 3 skipped in 60.85s"
     }
   },
+  "race_fix": {
+    "red": {
+      "categories": [
+        "immediate cancellation before worker registration",
+        "cold catalog cancellation still invoked backend tool",
+        "large write blocked timeout and close",
+        "ACTIVE backend reinitialize changed healthy state"
+      ]
+    },
+    "green": {
+      "targeted": "3 passed in 0.55s",
+      "large_write": "1 passed in 3.29s",
+      "focused": "32 passed in 13.19s",
+      "full": "548 passed, 3 skipped in 63.52s"
+    }
+  },
   "green": {
     "focused": {
       "command": "python -m pytest -q tests/test_mcp_gateway.py",
-      "result": "20 passed in 8.15s"
+      "result": "32 passed in 13.19s"
     },
     "full": {
       "command": "python -m pytest -q",
-      "result": "536 passed, 3 skipped in 58.38s"
+      "result": "548 passed, 3 skipped in 63.52s"
     },
     "static": {
       "command": "python -m ruff check src/token_governance/mcp_gateway.py tests/test_mcp_gateway.py tests/fixtures/strict_mcp_backend.py",

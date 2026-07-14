@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import re
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -225,7 +227,9 @@ class StdioMcpBackend:
         self.failure_reason: str | None = None
         self._pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
         self._lock = threading.Lock()
-        self._write_lock = threading.Lock()
+        self._writer_start_lock = threading.Lock()
+        self._write_queue: queue.Queue[tuple[bytes, threading.Event, dict[str, Any]] | None] = queue.Queue()
+        self._writer: threading.Thread | None = None
         self._stderr = deque()  # type: deque[bytes]
         self._stderr_size = 0
         self._reader: threading.Thread | None = None
@@ -253,6 +257,10 @@ class StdioMcpBackend:
         self._stderr_reader.start()
 
     def initialize(self) -> None:
+        if self.state is BackendState.ACTIVE:
+            raise RuntimeError(f"Backend {self.name} is already initialized")
+        if self.state is not BackendState.STARTING:
+            raise RuntimeError(f"Backend {self.name} is unavailable ({self.state.value.lower()})")
         try:
             self.start()
             result = self.request("initialize", {
@@ -280,6 +288,7 @@ class StdioMcpBackend:
 
     def request(self, method: str, params: dict[str, Any] | None = None,
                 *, request_id_observer: Any | None = None) -> dict[str, Any]:
+        deadline = time.monotonic() + self.timeout_seconds
         if method == "initialize" and self.state is not BackendState.STARTING:
             raise RuntimeError(f"Backend {self.name} is unavailable ({self.state.value.lower()})")
         if method != "initialize" and self.state is not BackendState.ACTIVE:
@@ -299,10 +308,10 @@ class StdioMcpBackend:
             "params": params or {},
         }
         try:
-            self._write(request)
+            self._write(request, deadline=deadline)
             if request_id_observer is not None:
                 request_id_observer(request_id)
-            if not event.wait(self.timeout_seconds):
+            if not event.wait(max(0.0, deadline - time.monotonic())):
                 self.cancel(request_id)
                 raise TimeoutError(f"Backend {self.name} request timed out")
             if "exception" in slot:
@@ -331,17 +340,48 @@ class StdioMcpBackend:
         except Exception:
             pass
 
-    def _write(self, payload: dict[str, Any]) -> None:
+    def _write(self, payload: dict[str, Any], *, deadline: float | None = None) -> None:
         proc = self.proc
         if proc is None or proc.stdin is None:
             raise RuntimeError(f"Backend {self.name} has no stdin")
         raw = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-        with self._write_lock:
+        self._ensure_writer()
+        event = threading.Event()
+        slot: dict[str, Any] = {}
+        self._write_queue.put((raw, event, slot))
+        write_deadline = deadline if deadline is not None else time.monotonic() + self.timeout_seconds
+        if not event.wait(max(0.0, write_deadline - time.monotonic())):
+            raise TimeoutError(f"Backend {self.name} write timed out")
+        if "exception" in slot:
+            raise RuntimeError(f"Backend {self.name} transport failed") from slot["exception"]
+
+    def _ensure_writer(self) -> None:
+        with self._writer_start_lock:
+            if self._writer is not None and self._writer.is_alive():
+                return
+            self._writer = threading.Thread(
+                target=self._write_frames,
+                name=f"tgl-{self.name}-stdin",
+                daemon=True,
+            )
+            self._writer.start()
+
+    def _write_frames(self) -> None:
+        while True:
+            item = self._write_queue.get()
+            if item is None:
+                return
+            raw, event, slot = item
+            proc = self.proc
             try:
+                if proc is None or proc.stdin is None:
+                    raise OSError("backend stdin unavailable")
                 proc.stdin.write(raw)
                 proc.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
-                raise RuntimeError(f"Backend {self.name} transport failed") from exc
+            except BaseException as exc:
+                slot["exception"] = exc
+            finally:
+                event.set()
 
     def _read_stdout(self) -> None:
         proc = self.proc
@@ -435,12 +475,23 @@ class StdioMcpBackend:
             self.state = BackendState.CLOSED
             return
         self.state = BackendState.CLOSING
-        with self._write_lock:
+        stdin_closed = threading.Event()
+
+        def close_stdin() -> None:
             if proc.stdin is not None:
                 try:
                     proc.stdin.close()
                 except OSError:
                     pass
+            stdin_closed.set()
+
+        stdin_closer = threading.Thread(
+            target=close_stdin,
+            name=f"tgl-{self.name}-stdin-close",
+            daemon=True,
+        )
+        stdin_closer.start()
+        stdin_closed.wait(0.05)
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -450,6 +501,10 @@ class StdioMcpBackend:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=2)
+        self._write_queue.put(None)
+        if self._writer is not None:
+            self._writer.join(timeout=2)
+        stdin_closer.join(timeout=0.1)
         for thread in (self._reader, self._stderr_reader):
             if thread is not None:
                 thread.join(timeout=2)
@@ -501,6 +556,7 @@ class McpGateway:
                 self._write_upstream(stdout, _error(None, -32600, "Invalid Request"))
                 continue
             if request.get("method") == "tools/call" and "id" in request and self._state is GatewayState.ACTIVE:
+                self._register_upstream(request.get("id"))
                 worker = threading.Thread(target=self._handle_async, args=(request, stdout), daemon=True)
                 self._workers.add(worker)
                 worker.start()
@@ -548,9 +604,10 @@ class McpGateway:
             if method == "tools/list":
                 return _result(request_id, {"tools": gateway_tool_definitions()})
             if method == "tools/call":
-                with self._pending_lock:
-                    self._upstream_pending[request_id] = ("", 0)
+                self._register_upstream(request_id)
                 self._current_upstream.request_id = request_id
+                if self._is_upstream_cancelled(request_id):
+                    raise RuntimeError("Request cancelled")
                 return _result(request_id, self._call_tool(request.get("params", {})))
             return _error(request_id, -32601, f"Method not found: {method}")
         except Exception as exc:
@@ -602,6 +659,14 @@ class McpGateway:
                 return
         if pending and pending[1]:
             self.backends[pending[0]].cancel(pending[1], str(reason))
+
+    def _register_upstream(self, request_id: Any) -> None:
+        with self._pending_lock:
+            self._upstream_pending.setdefault(request_id, ("", 0))
+
+    def _is_upstream_cancelled(self, request_id: Any) -> bool:
+        with self._pending_lock:
+            return request_id in self._cancelled_pending
 
     def _bind_backend_request(self, upstream_id: Any, backend_name: str, backend_id: int) -> None:
         with self._pending_lock:
@@ -660,6 +725,8 @@ class McpGateway:
                 raise TypeError("invoke_tool.arguments must be an object.")
             backend_name, schema = self._find_tool(tool_name)
             upstream_id = getattr(self._current_upstream, "request_id", None)
+            if self._is_upstream_cancelled(upstream_id):
+                raise RuntimeError("Request cancelled")
             return self.backends[backend_name].request(
                 "tools/call",
                 {"name": str(schema["name"]), "arguments": tool_args},

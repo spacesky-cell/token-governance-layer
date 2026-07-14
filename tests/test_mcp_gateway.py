@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -1012,3 +1014,142 @@ def test_gateway_start_failure_is_structured_unavailable(tmp_path):
     )
     assert unavailable["state"] == "closed"
     assert unavailable["reason"]
+
+
+def test_run_registers_immediate_cancellation_before_worker_handle(tmp_path):
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingGateway(McpGateway):
+        called = False
+
+        def handle(self, request):
+            if request.get("method") == "tools/call":
+                entered.set()
+                release.wait(timeout=2)
+            result = super().handle(request)
+            if request.get("method") == "tools/call":
+                finished.set()
+            return result
+
+        def _call_tool(self, params):
+            self.called = True
+            return {"content": []}
+
+    class Input:
+        def __iter__(self):
+            yield json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 77,
+                    "method": "tools/call",
+                    "params": {"name": "invoke_tool", "arguments": {}},
+                }
+            )
+            assert entered.wait(timeout=2)
+            yield json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 77, "reason": "immediate"},
+                }
+            )
+            release.set()
+            assert finished.wait(timeout=2)
+
+    gateway = BlockingGateway(ContextLedger(tmp_path / "immediate.sqlite"), {})
+    gateway._state = gateway._state.ACTIVE
+    stdout = StringIO()
+    gateway.run(Input(), stdout)
+
+    response = json.loads(stdout.getvalue())
+    assert response["error"]["message"] == "Request cancelled"
+    assert gateway.called is False
+
+
+def test_cold_catalog_cancellation_prevents_backend_tool_call(tmp_path):
+    events = tmp_path / "cold-cancel.jsonl"
+    release = tmp_path / "release"
+    backend = StdioMcpBackend(
+        [
+            sys.executable,
+            str(STRICT_BACKEND),
+            "--mode",
+            "slow-list",
+            "--events",
+            str(events),
+            "--release",
+            str(release),
+        ],
+        timeout_seconds=2,
+    )
+    gateway = McpGateway(ContextLedger(tmp_path / "cold.sqlite"), {"backend": backend})
+    gateway._state = gateway._state.ACTIVE
+    backend.initialize()
+    response = {}
+
+    import threading
+
+    worker = threading.Thread(
+        target=lambda: response.update(
+            gateway.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 88,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "invoke_tool",
+                        "arguments": {"tool_name": "backend::echo", "arguments": {}},
+                    },
+                }
+            )
+        )
+    )
+    worker.start()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if events.exists() and '"method": "tools/list"' in events.read_text(encoding="utf-8"):
+            break
+    gateway._cancel_upstream({"requestId": 88, "reason": "cold lookup cancelled"})
+    release.touch()
+    worker.join(timeout=3)
+    backend.close()
+
+    recorded = events.read_text(encoding="utf-8")
+    assert '"method": "tools/call"' not in recorded
+    assert response["error"]["message"] == "Request cancelled"
+
+
+def test_large_request_timeout_and_close_are_bounded_when_backend_never_reads():
+    backend = StdioMcpBackend(
+        [sys.executable, str(STRICT_BACKEND), "--mode", "never-read"],
+        timeout_seconds=1,
+    )
+    backend.initialize()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="timed out"):
+            backend.request(
+                "tools/call",
+                {"name": "echo", "arguments": {"value": "x" * (8 * 1024 * 1024)}},
+            )
+    finally:
+        backend.close()
+    assert time.monotonic() - started < 6
+    assert backend.state is BackendState.CLOSED
+
+
+def test_reinitialize_active_backend_preserves_healthy_process():
+    backend = StdioMcpBackend([sys.executable, str(STRICT_BACKEND)], timeout_seconds=2)
+    backend.initialize()
+    process = backend.proc
+    with pytest.raises(RuntimeError, match="already initialized"):
+        backend.initialize()
+    assert backend.state is BackendState.ACTIVE
+    assert backend.proc is process
+    assert process is not None and process.poll() is None
+    assert backend.request("tools/list")["tools"][0]["name"] == "echo"
+    backend.close()

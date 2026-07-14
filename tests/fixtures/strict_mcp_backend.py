@@ -35,6 +35,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="normal")
     parser.add_argument("--events", type=Path)
+    parser.add_argument("--release", type=Path)
     args = parser.parse_args()
     catalog_generation = 0
     for line in sys.stdin:
@@ -42,6 +43,9 @@ def main() -> None:
         record(args.events, message)
         method = message.get("method")
         request_id = message.get("id")
+        if method == "notifications/initialized" and args.mode == "never-read":
+            time.sleep(30)
+            continue
         if method == "initialize":
             version = "2024-11-05" if args.mode == "incompatible" else "2025-06-18"
             emit(
@@ -55,6 +59,10 @@ def main() -> None:
                 }
             )
         elif method == "tools/list":
+            if args.mode == "slow-list":
+                deadline = time.monotonic() + 5
+                while args.release is not None and not args.release.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
             if args.mode == "interleaved":
                 emit({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
             tool = dict(TOOLS[0])
