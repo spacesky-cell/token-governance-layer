@@ -324,6 +324,33 @@ def test_too_deep_json_is_a_safe_parse_error_and_server_continues(tmp_path):
     assert "private-payload" not in proc.stdout + proc.stderr
 
 
+def test_huge_integer_json_is_a_safe_parse_error_and_server_continues(tmp_path):
+    huge_id = "9" * 5000
+    private_payload = "private-huge-integer-payload"
+    malformed_request = (
+        '{"jsonrpc":"2.0","id":'
+        + huge_id
+        + ',"method":'
+        + json.dumps(private_payload)
+        + "}"
+    )
+    raw_input = malformed_request + "\n" + json.dumps(initialize_request()) + "\n"
+
+    proc, responses = run_session(tmp_path, [], raw_input=raw_input)
+
+    assert proc.returncode == 0, proc.stderr
+    assert responses[0] == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
+    assert responses[1]["id"] == 1
+    assert responses[1]["result"]["protocolVersion"] == PROTOCOL_VERSION
+    assert "Traceback" not in proc.stderr
+    assert private_payload not in proc.stdout + proc.stderr
+    assert huge_id not in proc.stdout + proc.stderr
+
+
 def test_mcp_server_accepts_utf8_bom_prefixed_json_lines(tmp_path):
     messages = active_messages(
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
