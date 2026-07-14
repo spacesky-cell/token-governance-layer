@@ -186,6 +186,57 @@ def test_global_command_discovery_rejects_noop_windows_shims(tmp_path, monkeypat
         discover_stable_commands({"TGL_NPM_WRAPPER": "1", "PATH": str(prefix)})
 
 
+def test_windows_shim_validator_rejects_echo_spoof(tmp_path):
+    shim = tmp_path / "tgl-claude-hook.CMD"
+    expected = tmp_path / "node_modules" / "token-governance-layer" / "bin" / "tgl-claude-hook.js"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("script", encoding="utf-8")
+    shim.write_text(
+        '@echo off\necho "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        encoding="utf-8",
+    )
+
+    assert installer_module._windows_shim_targets_script(shim, expected) is False
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'node "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        '"%_prog%" "%dp0%\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        'if exist "%dp0%\\node.exe" ( "%_prog%" "%dp0%\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %* )\n',
+    ],
+)
+def test_windows_shim_validator_accepts_node_invocation_patterns(tmp_path, content):
+    shim = tmp_path / "tgl-claude-hook.CMD"
+    expected = tmp_path / "node_modules" / "token-governance-layer" / "bin" / "tgl-claude-hook.js"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("script", encoding="utf-8")
+    shim.write_text(content, encoding="utf-8")
+
+    assert installer_module._windows_shim_targets_script(shim, expected) is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'rem node "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        'set TARGET="%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        'call unrelated.exe "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        'node --no-warnings "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+        'node unrelated.js "%~dp0\\node_modules\\token-governance-layer\\bin\\tgl-claude-hook.js" %*\n',
+    ],
+)
+def test_windows_shim_validator_rejects_non_invocation_lines(tmp_path, content):
+    shim = tmp_path / "tgl-claude-hook.CMD"
+    expected = tmp_path / "node_modules" / "token-governance-layer" / "bin" / "tgl-claude-hook.js"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("script", encoding="utf-8")
+    shim.write_text(content, encoding="utf-8")
+
+    assert installer_module._windows_shim_targets_script(shim, expected) is False
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows npm shim validation")
 def test_global_command_discovery_rejects_missing_manifest_bin_target(
     tmp_path, monkeypatch

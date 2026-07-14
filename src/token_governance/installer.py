@@ -203,22 +203,64 @@ def _windows_shim_targets_script(shim: Path, expected_script: Path) -> bool:
     except (OSError, UnicodeError):
         return False
     for line in lines:
-        stripped = line.strip()
-        lowered = stripped.lower()
-        if not stripped or lowered.startswith(("rem ", "::", "@echo", "set ", ":")):
-            continue
-        if "%*" not in stripped:
-            continue
-        for token in re.findall(r'"([^"]+)"', stripped):
-            expanded = re.sub(
-                r"%(?:~dp0|dp0%)\\?",
-                lambda _match: str(shim.parent) + os.sep,
-                token,
-                flags=re.IGNORECASE,
-            )
-            if _same_path(Path(expanded), expected_script):
+        for segment in _windows_shim_segments(line):
+            tokens = _windows_shim_tokens(segment)
+            if len(tokens) < 3 or tokens[-1].lower() != "%*":
+                continue
+            executable = tokens[0].lower()
+            if not _is_node_shim_executable(executable):
+                continue
+            target = _expand_windows_shim_path(tokens[1], shim)
+            if target is not None and _same_path(target, expected_script):
                 return True
     return False
+
+
+def _windows_shim_segments(line: str) -> list[str]:
+    """Split a cmd line at control separators while preserving quoted paths."""
+    segments: list[str] = []
+    start = 0
+    quoted = False
+    for index, char in enumerate(line):
+        if char == '"':
+            quoted = not quoted
+        elif not quoted and char in "&()":
+            if line[start:index].strip():
+                segments.append(line[start:index].strip())
+            start = index + 1
+    if line[start:].strip():
+        segments.append(line[start:].strip())
+    return segments
+
+
+def _windows_shim_tokens(segment: str) -> list[str]:
+    tokens: list[str] = []
+    for match in re.finditer(r'"([^"]*)"|([^\s]+)', segment):
+        token = match.group(1) if match.group(1) is not None else match.group(2)
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _is_node_shim_executable(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"node", "node.exe", "%_prog%", '"%_prog%"'}:
+        return True
+    if lowered.startswith("%") and lowered.endswith("%"):
+        return lowered in {"%node%", "%node_exe%", "%node.exe%"}
+    return lowered.replace("/", "\\").endswith("\\node.exe")
+
+
+def _expand_windows_shim_path(value: str, shim: Path) -> Path | None:
+    expanded = re.sub(
+        r"%(?:~dp0|dp0%)\\?",
+        lambda _match: str(shim.parent) + os.sep,
+        value,
+        flags=re.IGNORECASE,
+    )
+    if "%" in expanded:
+        return None
+    return Path(expanded)
 
 
 def install_project(
