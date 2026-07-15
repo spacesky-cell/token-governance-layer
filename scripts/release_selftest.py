@@ -4,6 +4,7 @@ import tempfile
 import tarfile
 import json
 import hashlib
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -183,17 +184,23 @@ class ReleaseEvidenceTests(unittest.TestCase):
             (root / "src" / "token_governance").mkdir(parents=True)
             (root / "src" / "token_governance" / "__init__.py").write_text('__version__ = "0.2.0"\n', encoding="utf-8")
             (root / "README.md").write_text("readme\n", encoding="utf-8")
-            first = root / "out1" / "token-governance-layer-0.2.0.tgz"
-            second = root / "out2" / "token-governance-layer-0.2.0.tgz"
-            # Builder tests use a synthetic npm-pack source and injected SHA.
-            build_package(root, first, git_sha="a" * 40, npm_pack_source=root)
-            build_package(root, second, git_sha="a" * 40, npm_pack_source=root)
-            self.assertEqual(first.read_bytes(), second.read_bytes())
-            with tarfile.open(first, "r:gz") as archive:
-                package = json.loads(archive.extractfile("package/package.json").read())
-            self.assertEqual(package["gitHead"], "a" * 40)
-            with self.assertRaises(FileExistsError):
-                build_package(root, first, git_sha="a" * 40, npm_pack_source=root)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "release-test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "release-test" + "@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+            with tempfile.TemporaryDirectory(prefix="tgl builder one ") as first_dir, tempfile.TemporaryDirectory(prefix="tgl builder two ") as second_dir:
+                first = Path(first_dir) / "token-governance-layer-0.2.0.tgz"
+                second = Path(second_dir) / "token-governance-layer-0.2.0.tgz"
+                build_package(root, first)
+                build_package(root, second)
+                self.assertEqual(first.read_bytes(), second.read_bytes())
+                with tarfile.open(first, "r:gz") as archive:
+                    package = json.loads(archive.extractfile("package/package.json").read())
+                expected_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+                self.assertEqual(package["gitHead"], expected_sha)
+                with self.assertRaises(FileExistsError):
+                    build_package(root, first)
 
 
 if __name__ == "__main__":

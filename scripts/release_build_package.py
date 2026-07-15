@@ -17,7 +17,6 @@ from release_common import (
     git_is_clean,
     read_version_sources,
     run,
-    validate_sha,
 )
 from release_verify_package import PackageVerificationError, inspect_archive
 
@@ -61,9 +60,6 @@ def _deterministic_tarball(files: dict[str, bytes]) -> bytes:
 def build_package(
     root: Path,
     output: Path,
-    *,
-    git_sha: str | None = None,
-    npm_pack_source: Path | None = None,
 ) -> str:
     sources = read_version_sources(root)
     version = sources["VERSION"]
@@ -72,13 +68,10 @@ def build_package(
         raise ReleaseError("output filename must be the exact versioned package name")
     if output.exists():
         raise FileExistsError(output)
-    if git_sha is None:
-        if not git_is_clean(root):
-            raise ReleaseError("worktree must be clean before building the final artifact")
-        git_sha = git_head(root)
-    else:
-        git_sha = validate_sha(git_sha)
-    source = npm_pack_source or root
+    if not git_is_clean(root):
+        raise ReleaseError("worktree must be clean before building the final artifact")
+    git_sha = git_head(root)
+    source = root
     with tempfile.TemporaryDirectory(prefix="tgl-build-package ") as directory:
         temporary = Path(directory)
         result = run(
