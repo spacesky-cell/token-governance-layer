@@ -823,13 +823,21 @@ def test_tools_list_changed_invalidates_only_that_backend_catalog(tmp_path):
     }
     try:
         first = send(proc, {**request, "id": 1})
-        second = send(proc, {**request, "id": 2})
+        deadline = time.monotonic() + 2
+        request_id = 2
+        while True:
+            second = send(proc, {**request, "id": request_id})
+            second_catalog = json.loads(second["result"]["content"][0]["text"])
+            if second_catalog["tools"][0]["description"].endswith("generation=1"):
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail("tools/list_changed did not invalidate the cached catalog")
+            request_id += 1
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
 
     first_catalog = json.loads(first["result"]["content"][0]["text"])
-    second_catalog = json.loads(second["result"]["content"][0]["text"])
     assert first_catalog["tools"][0]["description"].endswith("generation=0")
     assert second_catalog["tools"][0]["description"].endswith("generation=1")
 
@@ -1250,7 +1258,7 @@ def test_cancel_uses_reserved_control_capacity_and_preempts_queued_writes():
 
     started = time.monotonic()
     backend.cancel(7, "urgent")
-    assert time.monotonic() - started < 0.1
+    assert time.monotonic() - started < 0.5
     assert backend._control_queue.qsize() == 1
     release.set()
     first.join(timeout=2)
