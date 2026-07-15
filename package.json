@@ -1,6 +1,6 @@
 {
   "name": "token-governance-layer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Experimental local-first output governance for Claude Code.",
   "license": "MIT",
   "author": "Token Governance Layer Contributors",

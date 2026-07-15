@@ -1,6 +1,6 @@
 [project]
 name = "token-governance-layer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Experimental local-first output governance for Claude Code."
 requires-python = ">=3.10,<3.15"
 readme = "README.md"

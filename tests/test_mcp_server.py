@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from token_governance import __version__
+
 
 PROTOCOL_VERSION = "2025-06-18"
 ROOT = Path(__file__).resolve().parents[1]
@@ -169,7 +171,7 @@ def test_initialize_negotiates_supported_version_and_requires_notification(tmp_p
     assert [response["id"] for response in responses] == [1, 2, 3]
     assert responses[0]["result"] == {
         "protocolVersion": PROTOCOL_VERSION,
-        "serverInfo": {"name": "token-governance-layer", "version": "0.1.0"},
+        "serverInfo": {"name": "token-governance-layer", "version": __version__},
         "capabilities": {"tools": {}},
     }
     assert responses[1]["error"] == {

@@ -12,6 +12,7 @@ from .config import GovernanceConfig
 from .contracts import GovernanceMode, GovernanceRequest, SourceKind, Strategy
 from .core import create_governance_engine, default_governance_config
 from .ledger import ContextLedger, LedgerIntegrityError
+from . import __version__
 
 
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18",)
@@ -176,7 +177,7 @@ class McpServer:
             "protocolVersion": protocol_version,
             "serverInfo": {
                 "name": "token-governance-layer",
-                "version": "0.1.0",
+                "version": __version__,
             },
             "capabilities": {"tools": {}},
         }

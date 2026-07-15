@@ -4,7 +4,9 @@ All notable changes are documented here. This project follows semantic versionin
 
 ## [Unreleased]
 
-The changes below target v0.2.0 and are not published until the release workflow completes.
+## [0.2.0] - 2026-07-15
+
+The changes below target v0.2.0 and are published with the trustworthy release workflow.
 
 ### Added
 
@@ -42,5 +44,6 @@ The changes below target v0.2.0 and are not published until the release workflow
 
 - Initial npm package with local governance, SQLite receipts, Claude Hook, standalone MCP server, and prototype Gateway.
 
-[Unreleased]: https://github.com/spacesky-cell/token-governance-layer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/spacesky-cell/token-governance-layer/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/spacesky-cell/token-governance-layer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/spacesky-cell/token-governance-layer/releases/tag/v0.1.0
