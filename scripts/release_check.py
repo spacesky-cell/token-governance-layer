@@ -30,6 +30,8 @@ from release_common import (
 )
 from release_verify_package import PackageVerificationError, inspect_archive, scan_member_name, safe_member_path
 
+OFFICIAL_REGISTRY = "https://registry.npmjs.org/"
+
 PREFLIGHT_EVIDENCE_CHECKS = {
     "version_sources", "mcp_gateway_version", "release_documents", "tls", "clean_worktree", "local_tag_absent",
     "remote_tag_absent", "npm_ping", "npm_whoami", "npm_owner", "github_repository_access",
@@ -44,13 +46,15 @@ PACKAGE_EVIDENCE_CHECKS = {
 
 
 def _npm_auth_checks(env: dict[str, str]) -> list[dict[str, Any]]:
+    env = dict(env)
+    env["NPM_CONFIG_REGISTRY"] = OFFICIAL_REGISTRY
     checks: list[dict[str, Any]] = []
-    ping = run(["npm", "ping"], env=env, timeout=45)
+    ping = run(["npm", "ping", "--registry", OFFICIAL_REGISTRY], env=env, timeout=45)
     checks.append(check("npm_ping", ping.returncode == 0, "npm registry reachable"))
-    whoami = run(["npm", "whoami"], env=env, timeout=45)
+    whoami = run(["npm", "whoami", "--registry", OFFICIAL_REGISTRY], env=env, timeout=45)
     identity = whoami.stdout.strip() if whoami.returncode == 0 else ""
     checks.append(check("npm_whoami", bool(identity), "npm authentication available"))
-    owner = run(["npm", "owner", "ls", PACKAGE_NAME, "--json"], env=env, timeout=45)
+    owner = run(["npm", "owner", "ls", PACKAGE_NAME, "--json", "--registry", OFFICIAL_REGISTRY], env=env, timeout=45)
     owner_ok = False
     if owner.returncode == 0 and identity:
         try:
@@ -72,7 +76,7 @@ def _npm_auth_checks(env: dict[str, str]) -> list[dict[str, Any]]:
     return checks
 
 
-def _github_auth_checks(root: Path, branch: str, version: str) -> list[dict[str, Any]]:
+def _github_auth_checks(root: Path, branch: str, version: str, *, network_env: dict[str, str]) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     try:
         repository = github_get(f"/repos/{REPOSITORY}", root=root)
@@ -81,19 +85,21 @@ def _github_auth_checks(root: Path, branch: str, version: str) -> list[dict[str,
         checks.append(check("github_repository_access", write_ok, "GitHub Contents/Release write permission"))
     except ReleaseError:
         checks.append(check("github_repository_access", False, "GitHub authentication or repository access failed"))
-    feature = run(["git", "push", "--dry-run", "origin", f"HEAD:refs/heads/{branch}"], cwd=root, timeout=60)
+    feature = run(["git", "push", "--dry-run", "origin", f"HEAD:refs/heads/{branch}"], cwd=root, env=network_env, timeout=60)
     checks.append(check("github_feature_push_dry_run", feature.returncode == 0, "feature branch push dry-run"))
-    tag = run(["git", "push", "--dry-run", "origin", f"HEAD:refs/tags/v{version}"], cwd=root, timeout=60)
+    tag = run(["git", "push", "--dry-run", "origin", f"HEAD:refs/tags/v{version}"], cwd=root, env=network_env, timeout=60)
     checks.append(check("github_tag_push_dry_run", tag.returncode == 0, "release tag push dry-run"))
     return checks
 
 
-def _tag_absent(version: str, root: Path) -> list[dict[str, Any]]:
+def _tag_absent(version: str, root: Path, *, network_env: dict[str, str] | None) -> list[dict[str, Any]]:
     local = run(["git", "tag", "--list", f"v{version}"], cwd=root)
-    remote = run(["git", "ls-remote", "--exit-code", "--refs", "origin", f"refs/tags/v{version}"], cwd=root, timeout=45)
+    remote = None
+    if network_env is not None:
+        remote = run(["git", "ls-remote", "--exit-code", "--refs", "origin", f"refs/tags/v{version}"], cwd=root, env=network_env, timeout=45)
     return [
         check("local_tag_absent", local.returncode == 0 and not local.stdout.strip(), "release tag is not already present locally"),
-        check("remote_tag_absent", remote.returncode == 2, "release tag is not already present remotely"),
+        check("remote_tag_absent", remote is not None and remote.returncode == 2, "release tag is not already present remotely" if remote is not None else "remote tag check skipped because TLS verification is disabled"),
     ]
 
 
@@ -195,10 +201,10 @@ def run_check(version: str, phase: str, output: Path, *, root: Path = ROOT) -> i
         tls_ok = False
     checks.append(check("tls", tls_ok, "TLS verification enabled"))
     checks.append(check("clean_worktree", git_is_clean(root), "worktree is clean"))
-    checks.extend(_tag_absent(version, root))
+    checks.extend(_tag_absent(version, root, network_env=network_env if tls_ok else None))
     if tls_ok:
         checks.extend(_npm_auth_checks(network_env or {}))
-        checks.extend(_github_auth_checks(root, git_output("branch", "--show-current", root=root), version))
+        checks.extend(_github_auth_checks(root, git_output("branch", "--show-current", root=root), version, network_env=network_env or {}))
     else:
         checks.extend(
             [

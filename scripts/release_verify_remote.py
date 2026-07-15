@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+from urllib.parse import urlparse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ REQUIRED_TOPICS = {
     "context-governance",
     "local-first",
 }
+OFFICIAL_REGISTRY = "https://registry.npmjs.org/"
 
 
 def _append_failures_once(checks: list[dict[str, Any]], names: tuple[str, ...], detail: str) -> None:
@@ -48,6 +50,9 @@ def _append_failures_once(checks: list[dict[str, Any]], names: tuple[str, ...], 
 
 
 def _download(url: str) -> bytes:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "registry.npmjs.org":
+        raise ReleaseError("registry tarball URL is not the official HTTPS registry")
     request = urllib.request.Request(url, headers={"User-Agent": "token-governance-layer-release-verifier"})
     try:
         with urllib.request.urlopen(request, timeout=90) as response:
@@ -67,26 +72,43 @@ def _download(url: str) -> bytes:
         raise ReleaseError("registry artifact download failed") from exc
 
 
+def _isolated_npm_env(directory: Path, base: dict[str, str] | None = None) -> dict[str, str]:
+    env = clean_network_env(base or os.environ)
+    for key in list(env):
+        upper = key.upper()
+        if upper.startswith("NPM_CONFIG_") or upper in {"NPM_TOKEN", "NODE_AUTH_TOKEN"}:
+            env.pop(key, None)
+    userconfig = directory / "user.npmrc"
+    globalconfig = directory / "global.npmrc"
+    userconfig.write_text("", encoding="utf-8")
+    globalconfig.write_text("", encoding="utf-8")
+    env.update(
+        {
+            "NPM_CONFIG_USERCONFIG": str(userconfig),
+            "NPM_CONFIG_GLOBALCONFIG": str(globalconfig),
+            "NPM_CONFIG_CACHE": str(directory / "cache"),
+            "NPM_CONFIG_STRICT_SSL": "true",
+            "NPM_CONFIG_REGISTRY": OFFICIAL_REGISTRY,
+        }
+    )
+    return env
+
+
 def _registry_install(version: str, root: Path) -> bool:
     with tempfile.TemporaryDirectory(prefix="tgl-registry-verify-") as directory:
         base = Path(directory)
         prefix = base / "prefix"
-        cache = base / "cache"
-        userconfig = base / "npmrc"
-        userconfig.write_text("", encoding="utf-8")
-        env = clean_network_env()
+        env = _isolated_npm_env(base)
         for key in ("PYTHONPATH", "PYTHONHOME", "NODE_PATH"):
             env.pop(key, None)
         env.update(
             {
-                "NPM_CONFIG_USERCONFIG": str(userconfig),
-                "NPM_CONFIG_CACHE": str(cache),
                 "NPM_CONFIG_AUDIT": "false",
                 "NPM_CONFIG_FUND": "false",
             }
         )
         install = run(
-            ["npm", "install", "--global", "--prefix", str(prefix), f"{PACKAGE_NAME}@{version}", "--no-audit", "--no-fund"],
+            ["npm", "install", "--global", "--prefix", str(prefix), f"{PACKAGE_NAME}@{version}", "--registry", OFFICIAL_REGISTRY, "--no-audit", "--no-fund"],
             cwd=root,
             env=env,
             timeout=180,
@@ -152,7 +174,9 @@ def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: 
         )
     npm_meta: dict[str, Any] = {}
     try:
-        npm_result = run(["npm", "view", f"{PACKAGE_NAME}@{version}", "--json"], env=clean_network_env(), timeout=60)
+        with tempfile.TemporaryDirectory(prefix="tgl-registry-metadata-") as directory:
+            npm_env = _isolated_npm_env(Path(directory))
+            npm_result = run(["npm", "view", f"{PACKAGE_NAME}@{version}", "--json", "--registry", OFFICIAL_REGISTRY], env=npm_env, timeout=60)
         if npm_result.returncode != 0:
             raise ReleaseError("npm metadata unavailable")
         npm_meta = json.loads(npm_result.stdout)
@@ -168,7 +192,7 @@ def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: 
         checks.append(check("npm_integrity", integrity == actual_integrity, "npm integrity matches registry tarball"))
         downloaded_hash = hashlib.sha256(downloaded).hexdigest()
         checks.append(check("npm_tarball_hash", downloaded_hash == tarball_sha256, "registry tarball SHA-256 matches recorded artifact"))
-        latest = run(["npm", "view", PACKAGE_NAME, "dist-tags", "--json"], env=clean_network_env(), timeout=60)
+        latest = run(["npm", "view", PACKAGE_NAME, "dist-tags", "--json", "--registry", OFFICIAL_REGISTRY], env=npm_env, timeout=60)
         latest_value = json.loads(latest.stdout) if latest.returncode == 0 else {}
         checks.append(check("npm_latest", isinstance(latest_value, dict) and latest_value.get("latest") == version, "npm latest dist-tag matches release"))
         checks.append(check("npm_registry_install", _registry_install(version, root), "clean registry install and help smoke"))

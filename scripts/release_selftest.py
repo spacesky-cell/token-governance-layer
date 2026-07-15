@@ -5,6 +5,7 @@ import tarfile
 import json
 import hashlib
 import subprocess
+from unittest import mock
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from release_common import (
     tls_disabled_reasons,
     validate_version,
 )
+from release_check import _github_auth_checks, _tag_absent
+from release_verify_remote import OFFICIAL_REGISTRY, _isolated_npm_env
 from release_build_package import build_package
 from release_check import validate_publish_evidence
 from release_set_version import VersionUpdateError, set_version
@@ -89,7 +92,12 @@ class VersionUpdateTests(unittest.TestCase):
 class PackageSafetyTests(unittest.TestCase):
     def test_tar_paths_reject_traversal_and_wrong_root(self) -> None:
         self.assertEqual(safe_member_path("package/src/token_governance/cli.py"), Path("src/token_governance/cli.py"))
-        for name in ("../secret", "package/../../secret", "/absolute", "other/file"):
+        windows_drive = "package/C:" + "/" + "Users/alice/x"
+        drive_relative = "package/C:" + "relative"
+        colon_component = "package/foo" + ":bar"
+        unc = "package/" + "\\\\server\\share\\x"
+        double_slash = "package/" + "/server/share"
+        for name in ("../secret", "package/../../secret", "/absolute", "other/file", windows_drive, drive_relative, colon_component, unc, double_slash):
             with self.subTest(name=name), self.assertRaises(PackageVerificationError):
                 safe_member_path(name)
 
@@ -136,6 +144,51 @@ class PackageSafetyTests(unittest.TestCase):
 
 
 class ReleaseEvidenceTests(unittest.TestCase):
+    def test_disabled_tls_never_runs_git_remote_commands(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch("release_check.run", return_value=completed) as runner:
+            checks = _tag_absent("0.2.0", Path("."), network_env=None)
+        commands = [call.args[0] for call in runner.call_args_list]
+        self.assertFalse(any(command[1] == "ls-remote" for command in commands))
+        self.assertTrue(any(item["name"] == "remote_tag_absent" and not item["ok"] for item in checks))
+
+    def test_git_remote_commands_receive_sanitized_environment(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch("release_check.github_get", return_value={"permissions": {"push": True}}), mock.patch("release_check.run", return_value=completed) as runner:
+            _github_auth_checks(Path("."), "branch", "0.2.0", network_env={"PATH": "safe", "NPM_CONFIG_STRICT_SSL": "true"})
+        git_calls = [call for call in runner.call_args_list if call.args[0][0] == "git"]
+        self.assertGreaterEqual(len(git_calls), 2)
+        self.assertTrue(all(call.kwargs["env"]["NPM_CONFIG_STRICT_SSL"] == "true" for call in git_calls))
+
+    def test_remote_npm_environment_isolated_from_user_auth_and_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = {"PATH": "safe", "NPM_TOKEN": "secret", "NPM_CONFIG_REGISTRY": "https://evil.invalid/", "NPM_CONFIG_USERCONFIG": "private"}
+            environment = _isolated_npm_env(Path(directory), base)
+            self.assertEqual(environment["NPM_CONFIG_REGISTRY"], OFFICIAL_REGISTRY)
+            self.assertEqual(environment["NPM_CONFIG_STRICT_SSL"], "true")
+            self.assertNotIn("NPM_TOKEN", environment)
+            self.assertTrue(Path(environment["NPM_CONFIG_USERCONFIG"]).read_text() == "")
+
+    def test_builder_rejects_prepare_lifecycle_tracked_file_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "VERSION").write_text("0.2.0\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text('[project]\nversion = "0.2.0"\n', encoding="utf-8")
+            (root / "src" / "token_governance").mkdir(parents=True)
+            (root / "src" / "token_governance" / "__init__.py").write_text('__version__ = "0.2.0"\n', encoding="utf-8")
+            (root / "README.md").write_text("before\n", encoding="utf-8")
+            (root / "mutate.js").write_text('require("fs").writeFileSync("README.md", "after\\n");\n', encoding="utf-8")
+            package = {"name": "token-governance-layer", "version": "0.2.0", "files": ["README.md", "mutate.js"], "scripts": {"prepare": "node mutate.js"}}
+            (root / "package.json").write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "release-test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "release-test" + "@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+            output = Path(directory) / "token-governance-layer-0.2.0.tgz"
+            with self.assertRaises(Exception):
+                build_package(root, output)
+            self.assertFalse(output.exists())
     def _publish_fixture(self, root: Path, *, artifact_bytes: bytes = b"{}\n", evidence_hash: str | None = None) -> Path:
         release = root / ".tgl" / "release" / "v0.2.0"
         release.mkdir(parents=True)

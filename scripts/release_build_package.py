@@ -85,6 +85,10 @@ def build_package(
         packed = temporary / expected_name
         if not packed.is_file():
             raise ReleaseError("npm pack did not create the expected package")
+        if not git_is_clean(root) or git_head(root) != git_sha:
+            raise ReleaseError("tracked source drifted during npm pack")
+        if output.exists():
+            raise FileExistsError(output)
         files = inspect_archive(packed)
     package_data = files.get("package.json")
     if package_data is None:
@@ -95,6 +99,8 @@ def build_package(
     package["gitHead"] = git_sha
     files["package.json"] = (json.dumps(package, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     content = _deterministic_tarball(files)
+    if output.exists():
+        raise FileExistsError(output)
     _atomic_link_write(output, content)
     return file_sha256(output)
 

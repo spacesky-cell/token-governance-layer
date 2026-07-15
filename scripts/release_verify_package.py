@@ -72,6 +72,12 @@ def scan_member_name(name: str) -> str | None:
 def safe_member_path(name: str) -> Path:
     if "\\" in name:
         raise PackageVerificationError("package member uses an unsafe separator")
+    if name.startswith("//") or ":" in name:
+        raise PackageVerificationError("package member uses Windows root or drive semantics")
+    if name.startswith("package/") and (
+        name[len("package/") :].startswith("/") or "//" in name[len("package/") :]
+    ):
+        raise PackageVerificationError("package member contains an empty path component")
     path = PurePosixPath(name)
     if path.is_absolute() or not path.parts or path.parts[0] != "package":
         raise PackageVerificationError("package member is outside package root")
