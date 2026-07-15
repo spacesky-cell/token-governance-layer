@@ -37,7 +37,7 @@ The changes below target v0.2.0 and are published with the trustworthy release w
 ### Security
 
 - Secret-like, malformed, oversized, unavailable, and failed-verification content passes through without raw receipt persistence.
-- Ledger files and SQLite sidecars receive current-user protections, with a documented plaintext same-user threat boundary.
+- Ledger files and SQLite sidecars receive current-user protections without modifying active POSIX WAL files, with a documented plaintext same-user threat boundary.
 - Gateway stderr is bounded and secret-redacted; protocol output remains separate.
 
 ## [0.1.0] - 2026-07-09

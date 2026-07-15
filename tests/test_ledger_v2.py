@@ -803,6 +803,8 @@ def test_every_connect_does_not_create_or_secure_sidecars_before_sqlite_open(
         event == "secure" and candidate != path
         for event, candidate in events[:2]
     )
+    if os.name != "nt":
+        assert events == [("secure", path), ("connect", None)]
 
 
 def test_post_connect_security_failure_closes_connection_and_is_fixed(
@@ -1047,4 +1049,10 @@ def test_concurrent_thread_and_process_writes_finish_within_bound(tmp_path):
 
     assert time.monotonic() - started < 10
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM governance_events").fetchone()[0] == 12
+        token_counts = [
+            row[0]
+            for row in conn.execute(
+                "SELECT token_count FROM governance_events ORDER BY token_count"
+            )
+        ]
+    assert token_counts == list(range(12))

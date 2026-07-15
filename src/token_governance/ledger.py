@@ -386,12 +386,11 @@ class ContextLedger:
             raise LedgerSecurityError() from exc
 
     def _secure_existing_storage(self) -> None:
-        secure = (
-            _ensure_windows_private_file if os.name == "nt" else _ensure_posix_private_file
-        )
+        if os.name != "nt":
+            return
         try:
             for path in self._storage_paths():
-                secure(path, create=False)
+                _ensure_windows_private_file(path, create=False)
         except LedgerSecurityError:
             raise
         except Exception as exc:

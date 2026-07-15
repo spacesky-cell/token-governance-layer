@@ -12,7 +12,7 @@ The project installer normally places the ledger at `.tgl/ledger.sqlite`. SQLite
 
 Receipt contents are plaintext. TGL creates private files and directories and applies current-user-only permissions where the platform supports them:
 
-- POSIX ledger files are regular, non-symlink files with mode `0600`; unsafe parent symlinks are rejected.
+- POSIX ledger files are regular, non-symlink files with mode `0600`; SQLite derives active sidecar modes from the protected main database, and unsafe parent symlinks are rejected.
 - Windows ledger and sidecar files receive a DACL for the current user.
 
 These controls reduce accidental cross-account access. They do not protect against:

@@ -163,7 +163,11 @@ class ReleaseEvidenceTests(unittest.TestCase):
     def test_remote_npm_environment_isolated_from_user_auth_and_registry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = {"PATH": "safe", "NPM_TOKEN": "secret", "NPM_CONFIG_REGISTRY": "https://evil.invalid/", "NPM_CONFIG_USERCONFIG": "private"}
-            environment = _isolated_npm_env(Path(directory), base)
+            with mock.patch(
+                "release_verify_remote.clean_network_env",
+                side_effect=lambda value: dict(value),
+            ):
+                environment = _isolated_npm_env(Path(directory), base)
             self.assertEqual(environment["NPM_CONFIG_REGISTRY"], OFFICIAL_REGISTRY)
             self.assertEqual(environment["NPM_CONFIG_STRICT_SSL"], "true")
             self.assertNotIn("NPM_TOKEN", environment)
