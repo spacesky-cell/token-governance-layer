@@ -172,6 +172,14 @@ def validate_result(data: Any) -> list[str]:
                     before_total += numeric[0]
                     after_total += numeric[1]
                     saved_total += numeric[2]
+                if case.get("action") not in {"passthrough", "transform"}:
+                    errors.append(f"case {index} action is invalid")
+                if case.get("risk") not in {"low", "medium", "high", "unavailable"}:
+                    errors.append(f"case {index} risk is invalid")
+                if case.get("strategy") not in {"passthrough", "repetitive_log", "test_output", "build_output"}:
+                    errors.append(f"case {index} strategy is invalid")
+                if not isinstance(case.get("preservation"), bool):
+                    errors.append(f"case {index} preservation is invalid")
                 evidence = case.get("protected_fact_evidence")
                 if not isinstance(evidence, list):
                     errors.append(f"case {index} protected evidence is invalid")
@@ -187,6 +195,9 @@ def validate_result(data: Any) -> list[str]:
                 errors.append("aggregate case count is inconsistent")
             if aggregate.get("estimated_tokens_before") != before_total or aggregate.get("estimated_tokens_after") != after_total or aggregate.get("estimated_tokens_saved") != saved_total:
                 errors.append("aggregate token counts are inconsistent")
+            expected_ratio = round(saved_total / before_total, 6) if before_total else 0.0
+            if aggregate.get("reduction_ratio") != expected_ratio:
+                errors.append("aggregate reduction ratio is inconsistent")
     return errors
 
 
