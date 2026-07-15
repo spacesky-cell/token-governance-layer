@@ -4,7 +4,7 @@ Token Governance Layer is local-first, but local-first does not mean encrypted o
 
 ## Stored data
 
-TGL creates a SQLite ledger only for output that was actually transformed and passed independent preservation verification. A v2 receipt contains the normalized original, governed candidate, integrity hash, strategy, closed risk/reason fields, estimated token counts, preservation result, delivery state, and timestamps. Passthrough output does not create a receipt. Governance events use closed metadata and do not store raw payloads or free-form tool input.
+TGL may create or open an empty local SQLite ledger during startup, before any payload is classified. Ledger initialization does not itself persist tool output. Only output that was transformed and passed independent preservation verification creates a v2 receipt and stores its normalized original. A receipt also contains the governed candidate, integrity hash, strategy, closed risk/reason fields, estimated token counts, preservation result, delivery state, and timestamps. Passthrough output does not create a receipt; passthrough governance events use closed metadata and do not store raw payloads or free-form tool input.
 
 The project installer normally places the ledger at `.tgl/ledger.sqlite`. SQLite sidecar files such as `-wal` and `-shm` may exist while the database is open.
 

@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import sys
+from collections import namedtuple
 
 import pytest
 
@@ -16,6 +17,39 @@ from token_governance.installer import (
     uninstall_project,
 )
 from token_governance import installer as installer_module
+
+
+@pytest.mark.parametrize(
+    ("major", "minor", "supported"),
+    [(3, 9, False), (3, 10, True), (3, 14, True), (3, 15, False)],
+)
+def test_project_doctor_enforces_supported_python_range(
+    tmp_path,
+    monkeypatch,
+    major,
+    minor,
+    supported,
+):
+    version_info = namedtuple(
+        "version_info",
+        ("major", "minor", "micro", "releaselevel", "serial"),
+    )
+    monkeypatch.setattr(
+        installer_module.sys,
+        "version_info",
+        version_info(major, minor, 0, "final", 0),
+    )
+
+    report = doctor_project(tmp_path, integration=False)
+    python_check = next(
+        check for check in report["checks"] if check["name"] == "python"
+    )
+
+    assert python_check == {
+        "name": "python",
+        "ok": supported,
+        "message": f"Python {major}.{minor}",
+    }
 
 
 def stable_commands(tmp_path):

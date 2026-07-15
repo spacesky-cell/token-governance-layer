@@ -2,10 +2,7 @@
 
 ## Supported versions
 
-| Version | Security fixes |
-| --- | --- |
-| 0.2.x | Supported |
-| 0.1.x | Not supported |
+Security fixes are provided for the latest minor release line published on npm. Run `npm view token-governance-layer version`; the corresponding `major.minor.x` line is supported, and older minor lines are not. Repository changes that have not yet been published are development snapshots, not supported releases.
 
 ## Report privately
 

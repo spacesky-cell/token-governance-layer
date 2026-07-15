@@ -25,6 +25,8 @@ STATE_PATH = Path(".tgl/install-state.json")
 OWNERSHIP_PATH = Path(".tgl/install-ownership.json")
 SERVER_NAME = "token-governance-layer"
 DEFAULT_MATCHER = "Bash|PowerShell|Read|Grep|Glob|LS|Task|WebFetch|WebSearch"
+MIN_SUPPORTED_PYTHON = (3, 10)
+MAX_SUPPORTED_PYTHON_EXCLUSIVE = (3, 15)
 GLOBAL_INSTALL_GUIDANCE = (
     "Persistent Claude installation requires `npm install -g "
     "token-governance-layer`; npm exec/npx temporary installs are not supported"
@@ -477,7 +479,12 @@ def doctor_project(
     checks: list[dict[str, Any]] = []
     config_ok = _doctor_config(paths["config"])
     checks.append(_check("config", config_ok, "Config is valid" if config_ok else "Config is unavailable or invalid"))
-    python_ok = sys.version_info >= (3, 10)
+    python_version = (sys.version_info.major, sys.version_info.minor)
+    python_ok = (
+        MIN_SUPPORTED_PYTHON
+        <= python_version
+        < MAX_SUPPORTED_PYTHON_EXCLUSIVE
+    )
     checks.append(_check("python", python_ok, f"Python {sys.version_info.major}.{sys.version_info.minor}"))
 
     settings = _doctor_read_object(paths["settings"])
