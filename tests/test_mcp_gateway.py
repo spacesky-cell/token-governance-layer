@@ -1202,3 +1202,63 @@ def test_worker_snapshot_is_safe_when_workers_finish_during_close(tmp_path):
     gateway._state = gateway._state.ACTIVE
     gateway.run(Input(), StringIO())
     assert not gateway._workers
+
+
+def test_cancel_uses_reserved_control_capacity_and_preempts_queued_writes():
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Stdin:
+        def __init__(self):
+            self.frames = []
+            self.first = True
+
+        def write(self, value):
+            if self.first:
+                self.first = False
+                entered.set()
+                release.wait(timeout=2)
+            self.frames.append(value)
+
+        def flush(self):
+            return None
+
+    class Process:
+        stdin = Stdin()
+
+    backend = StdioMcpBackend(["unused"], timeout_seconds=1)
+    backend.proc = Process()
+    backend.state = BackendState.ACTIVE
+    backend._pending[7] = (threading.Event(), {})
+    first = threading.Thread(
+        target=backend._write,
+        args=({"jsonrpc": "2.0", "id": 1, "method": "ordinary"},),
+    )
+    first.start()
+    assert entered.wait(timeout=1)
+    for index in range(backend._write_queue.maxsize):
+        backend._write_queue.put_nowait(
+            (
+                json.dumps({"jsonrpc": "2.0", "id": index + 10, "method": "queued"}).encode()
+                + b"\n",
+                threading.Event(),
+                {},
+            )
+        )
+
+    started = time.monotonic()
+    backend.cancel(7, "urgent")
+    assert time.monotonic() - started < 0.1
+    assert backend._control_queue.qsize() == 1
+    release.set()
+    first.join(timeout=2)
+    deadline = time.monotonic() + 2
+    while len(backend.proc.stdin.frames) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    backend._writer_stop.set()
+    backend._writer.join(timeout=2)
+
+    methods = [json.loads(frame)["method"] for frame in backend.proc.stdin.frames[:2]]
+    assert methods == ["ordinary", "notifications/cancelled"]

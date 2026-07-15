@@ -233,7 +233,12 @@ class StdioMcpBackend:
         self._write_queue: queue.Queue[tuple[bytes, threading.Event, dict[str, Any]] | None] = queue.Queue(
             maxsize=self.WRITE_QUEUE_MAXSIZE
         )
+        self._control_queue: queue.Queue[tuple[bytes, threading.Event, dict[str, Any]] | None] = queue.Queue(
+            maxsize=2
+        )
         self._writer_stop = threading.Event()
+        self._close_async_lock = threading.Lock()
+        self._close_async_started = False
         self._writer: threading.Thread | None = None
         self._stderr = deque()  # type: deque[bytes]
         self._stderr_size = 0
@@ -341,7 +346,14 @@ class StdioMcpBackend:
             if request_id not in self._pending:
                 return
         try:
-            self.notify("notifications/cancelled", {"requestId": request_id, "reason": _redact(reason)})
+            control_written = self._write_control(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": request_id, "reason": _redact(reason)},
+                }
+            )
+            control_written.wait(0.05)
         except Exception:
             pass
 
@@ -368,6 +380,31 @@ class StdioMcpBackend:
         if "exception" in slot:
             raise RuntimeError(f"Backend {self.name} transport failed") from slot["exception"]
 
+    def _write_control(self, payload: dict[str, Any]) -> threading.Event:
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            raise RuntimeError(f"Backend {self.name} has no stdin")
+        raw = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(raw) > self.MAX_FRAME_BYTES:
+            raise ValueError(f"Backend {self.name} frame too large")
+        self._ensure_writer()
+        written = threading.Event()
+        try:
+            self._control_queue.put_nowait((raw, written, {}))
+        except queue.Full as exc:
+            self._fail_and_close("Backend control queue is full")
+            raise RuntimeError(f"Backend {self.name} control queue is full") from exc
+        return written
+
+    def _fail_and_close(self, reason: str) -> None:
+        self.failure_reason = _redact(reason)
+        self.state = BackendState.FAILED
+        with self._close_async_lock:
+            if self._close_async_started:
+                return
+            self._close_async_started = True
+        threading.Thread(target=self.close, name=f"tgl-{self.name}-close", daemon=True).start()
+
     def _ensure_writer(self) -> None:
         with self._writer_start_lock:
             if self._writer is not None and self._writer.is_alive():
@@ -381,12 +418,16 @@ class StdioMcpBackend:
 
     def _write_frames(self) -> None:
         while True:
+            item = None
             try:
-                item = self._write_queue.get(timeout=0.1)
+                item = self._control_queue.get_nowait()
             except queue.Empty:
-                if self._writer_stop.is_set():
-                    return
-                continue
+                try:
+                    item = self._write_queue.get(timeout=0.005)
+                except queue.Empty:
+                    if self._writer_stop.is_set():
+                        return
+                    continue
             if item is None:
                 return
             raw, event, slot = item
@@ -525,6 +566,10 @@ class StdioMcpBackend:
         self._writer_stop.set()
         try:
             self._write_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self._control_queue.put_nowait(None)
         except queue.Full:
             pass
         if self._writer is not None:
