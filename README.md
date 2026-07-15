@@ -1,468 +1,176 @@
-﻿# Token Governance Layer
+# Token Governance Layer
 
-[中文](#中文说明) | [English](#english)
+[![Status: Experimental](https://img.shields.io/badge/status-experimental-orange)](https://github.com/spacesky-cell/token-governance-layer)
+[![CI](https://github.com/spacesky-cell/token-governance-layer/actions/workflows/ci.yml/badge.svg)](https://github.com/spacesky-cell/token-governance-layer/actions/workflows/ci.yml)
+[![Python 3.10-3.14](https://img.shields.io/badge/python-3.10--3.14-blue)](https://www.python.org/)
+[![Node 22-24](https://img.shields.io/badge/node-22--24-339933)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Local-first token governance for coding agents. It automatically compresses long
-tool outputs before they re-enter the model context, records a local receipt,
-and lets the agent restore the original payload when needed.
+**Experimental.** Token Governance Layer is a local-first output governance layer for Claude Code: it conservatively compacts registered repetitive logs, test progress, and build progress before they re-enter model context, while keeping exact local originals for transformed output.
 
-## 中文说明
+## 30-second setup
 
-### 它解决什么问题
+Requires Python 3.10-3.14 and Node.js 22 or 24 on Windows, macOS, or Linux.
 
-开发者在使用 Claude Code、MCP 工具或其他编码 Agent 时，长日志、搜索结果、
-文件片段、工具 schema 很容易反复进入上下文，造成 token 浪费。Token Governance
-Layer 的目标是把这类内容自动治理掉：能省就省，不能省就原样通过，同时保留可审计、
-可恢复的本地凭证。
-
-### 当前能力
-
-- 本地优先的治理引擎，默认策略保守。
-- SQLite receipt ledger，原文保存在本地。
-- Claude Code `PostToolUse` 自动 hook。
-- MCP 恢复和审计工具：
-  - `retrieve_original`
-  - `explain_receipt`
-  - `show_savings`
-  - `list_context_risks`
-- MCP gateway：先暴露紧凑工具目录，需要时再加载完整 schema。
-- npm 分发 wrapper：用户可通过 `npm install -g` 或 `npx` 使用。
-
-### 真实基准数据
-
-下面的数据来自 2026-07-09 在本仓库运行的真实样本，不是合成日志。样本包含
-`npm pack --dry-run` 输出、`pytest -q` 输出、核心源码文件、MCP gateway 源码、
-README 文档和源码/测试关键词搜索结果。token 数使用项目内置的确定性本地估算器
-`token_governance.tokenizer.estimate_tokens`，用于稳定对比治理前后上下文大小。
-
-| 样本 | 行数 | 动作 | 治理前 token | 治理后 token | 节省 token | 节省率 |
-|---|---:|---|---:|---:|---:|---:|
-| `npm pack --dry-run` 发布包清单 | 34 | summarize | 337 | 107 | 230 | 68.25% |
-| `pytest -q` 测试输出 | 2 | passthrough | 48 | 48 | 0 | 0.00% |
-| 核心治理引擎源码 | 107 | summarize | 591 | 70 | 521 | 88.16% |
-| MCP gateway 源码 | 510 | summarize | 4,182 | 403 | 3,779 | 90.36% |
-| README 文档上下文 | 407 | summarize | 2,070 | 114 | 1,956 | 94.49% |
-| 源码和测试关键词搜索结果 | 3 | passthrough | 44 | 44 | 0 | 0.00% |
-
-汇总结果：
-
-- 总样本数：6
-- 治理前：7,272 estimated tokens
-- 治理后：786 estimated tokens
-- 总节省：6,486 estimated tokens
-- 总体节省率：89.19%
-- 触发压缩：4 个样本；短输出原样通过：2 个样本
-- 风险等级：6 个样本均为 `low`
-
-这组数据反映了当前默认策略的核心行为：长源码、长文档、长命令输出会显著缩短；
-很短的测试输出和搜索结果不会为了“看起来节省”而强行压缩。
-
-### 快速使用：npm 安装
-
-```powershell
+```bash
 npm install -g token-governance-layer
-cd "<your-project>"
+cd /path/to/your-project
+tgl init --project .
 tgl claude-install --project .
+tgl doctor --project . --integration
 claude
 ```
 
-也可以不全局安装：
+The installer uses stable absolute commands from the global npm installation. `npx`/`npm exec` cannot create a persistent Claude integration.
 
-```powershell
-cd "<your-project>"
-npx token-governance-layer claude-install --project .
-claude
-```
+## What Claude sees
 
-npm 包会暴露这些命令：
+Given a registered repetitive-log command, four identical lines can become one reconstructable marker while the unique final state remains verbatim:
 
 ```text
-tgl
-tgl-mcp
-tgl-mcp-gateway
-tgl-claude-hook
+# Before
+heartbeat service waiting for worker
+heartbeat service waiting for worker
+heartbeat service waiting for worker
+heartbeat service waiting for worker
+service ready
+
+# Governed output
+[TGL D 0-3 x4]
+service ready
 ```
 
-要求机器上有 Python 3.10+。Windows 下 wrapper 会依次尝试 `py -3`、`python`、
-`python3`；macOS/Linux 下会尝试 `python3`、`python`。
+**Safety boundary:** output is transformed only when a built-in strategy matches, the candidate is smaller, and an independent preservation check passes. Unknown output, source, diffs, search results, JSON, secret-like content, malformed requests, oversized payloads, and incomplete installations pass through unchanged. Stored originals are plaintext in a local SQLite ledger protected for the current OS user; this is not encryption and does not defend against the same account, administrators/root, or a compromised machine.
 
-### Claude Code 自动治理
+## Conservative behavior
 
-在项目目录执行：
+Automatic Claude Code transformation is limited to structured `Bash` and `PowerShell` results that match one registered family:
 
-```powershell
-tgl claude-install --project .
-```
+| Strategy | Recognized surface | What may be folded |
+| --- | --- | --- |
+| `repetitive_log` | Registered log commands such as `tail *.log`, `journalctl`, `docker logs`, and `kubectl logs` | Three or more consecutive, identical, non-protected lines |
+| `test_output` | Registered test commands with a recognized test-output signature | Consecutive duplicates or registered test progress units |
+| `build_output` | Registered build commands with a recognized build-output signature | Consecutive duplicates or registered build progress units |
 
-它只会写入项目级配置：
+Stderr, exit status, interruption state, warnings, errors, failures, tracebacks, assertions, final test/build summaries, and detected paths are protected. Source-like content, diffs, search commands, JSON/JSONL records, mixed or ambiguous command families, and unregistered output do not match an automatic strategy.
 
-- `.claude/settings.json`：注册 `PostToolUse` hook。
-- `.mcp.json`：注册 `token-governance-layer` MCP server，用于恢复和审计。
-- `.tgl/claude-ledger.sqlite`：本地 receipt ledger。
+The secret detector is a conservative best-effort guard, not a data-loss-prevention system. When it detects a secret-like marker, TGL passes the payload through and does not persist it. See [Security and privacy](docs/security.md) for the complete threat model and retention guidance.
 
-之后正常启动 Claude Code：
+## Installation lifecycle
 
-```powershell
-claude
-```
+`tgl init --project .` creates `token-governance.config.json` only when it is absent. `tgl claude-install --project .` then merges TGL-owned entries into:
 
-用户不需要手动调用 `govern_context`。当 Claude 使用 `Bash`、`PowerShell`、`Read`、
-`Grep`、`Glob`、`LS`、`Task`、`WebFetch`、`WebSearch` 等高输出工具时，如果治理后
-更短，hook 会自动替换工具输出并附加 receipt ID。
+- `.claude/settings.json` for the `PostToolUse` hook;
+- `.mcp.json` for the standalone restore/audit MCP server;
+- `.tgl/install-ownership.json` and `.tgl/install-state.json` for exact ownership and completeness checks.
 
-需要原文时，在 Claude 中让它调用 MCP：
-
-```text
-Use retrieve_original for receipt_id tgl_<id>.
-Use explain_receipt for receipt_id tgl_<id>.
-Use show_savings to show token governance savings.
-```
-
-### CLI 使用
-
-治理 stdin：
+The hook remains passthrough until the install state is complete. Diagnose without writes:
 
 ```bash
-type long-log.txt | tgl govern --content-type log
+tgl doctor --project .
+tgl doctor --project . --integration
 ```
 
-指定 ledger：
+If doctor reports an incomplete TGL-owned installation, repair it explicitly from the same proven global installation:
 
 ```bash
-type long-log.txt | tgl --db ./.tgl/ledger.sqlite govern --content-type log --source local-test
+tgl claude-install --project . --repair
+tgl doctor --project . --integration
 ```
 
-恢复原文：
+If recorded global command paths changed, uninstall before reinstalling. If ownership cannot be proven, repair first; uninstall deliberately preserves unproven Hook/MCP entries.
+
+Exact uninstall flow:
 
 ```bash
+tgl claude-uninstall --project .
+npm uninstall -g token-governance-layer
+```
+
+Project config and `.tgl/ledger.sqlite` are preserved so receipts remain recoverable. Review or back them up before deleting them manually.
+
+## CLI and receipts
+
+Manual governance accepts stdin and the same closed strategy set:
+
+```bash
+tgl --db ./.tgl/ledger.sqlite govern --strategy repetitive_log < app.log
 tgl --db ./.tgl/ledger.sqlite retrieve tgl_<receipt_id>
-```
-
-查看 receipt：
-
-```bash
 tgl --db ./.tgl/ledger.sqlite inspect tgl_<receipt_id>
-```
-
-查看累计节省：
-
-```bash
 tgl --db ./.tgl/ledger.sqlite stats
+tgl --db ./.tgl/ledger.sqlite risks
 ```
 
-### MCP Server
+The v0.2 CLI contract uses `--strategy auto|repetitive_log|test_output|build_output`. The old `--content-type` and `--source` arguments were removed.
 
-通过 stdio 启动：
+Receipts are created only for verified transformations. A receipt is **prepared** after the original and candidate are committed locally; adapters mark it **emitted** only after transformed output is written successfully. Reported savings are deterministic **candidate savings** (`estimated tokens before - estimated tokens after`), and top-level `stats` counts emitted transformations only. These values are not provider billing measurements.
+
+## MCP restore and audit
+
+The globally installed Claude integration configures `tgl-mcp` automatically. A standalone client can run it directly:
 
 ```bash
-tgl-mcp --db ./.tgl/ledger.sqlite
+tgl-mcp --config /absolute/path/to/token-governance.config.json
 ```
 
-MCP client 配置示例：
+It exposes `govern_context`, `retrieve_original`, `explain_receipt`, `show_savings`, and `list_context_risks`. MCP retrieval is paginated: call `retrieve_original` with `receipt_id`, `offset` (default `0`), and `max_chars` (default `4096`, maximum `16384`), then continue with `next_offset` until it is `null`. Use the CLI `retrieve` command for one exact full export.
 
-```json
-{
-  "mcpServers": {
-    "token-governance-layer": {
-      "command": "tgl-mcp",
-      "args": ["--db", "./.tgl/ledger.sqlite"]
-    }
-  }
-}
-```
+The v0.2 MCP migration removes `content_type`/`source` from `govern_context` and removes unbounded `full` retrieval. See [CHANGELOG.md](CHANGELOG.md) for breaking changes.
 
-### MCP Gateway
+## Experimental MCP Gateway
 
-gateway 可以包装多个后端 MCP server，让客户端先看到紧凑工具目录，再按需读取
-完整 schema。
+`tgl-mcp-gateway` is an optional, experimental tools-only proxy. It exposes a compact backend tool catalog and invokes qualified backend tools. Its `get_tool_schema` surface currently hits a v2-blocked legacy receipt path and returns an error. It does **not** proxy MCP resources or prompts, and strict local fixtures do not prove broad real-server interoperability.
+
+The Gateway is outside the primary Claude setup. Read [Gateway configuration, lifecycle, and limits](docs/gateway.md) before enabling it.
+
+## Deterministic microbenchmark
+
+<!-- TGL-BENCHMARK:START -->
+<!-- TGL-BENCHMARK:RESULT-SHA256 8146af8b74d92abc4356654dbab124956c0527243fc928876d97214adf0fe18b -->
+
+The checked-in v0.2.0 deterministic microbenchmark contains 14 fixed cases. Five transform and nine pass through; all protected-fact checks pass. The local estimator reports 348 tokens before and 307 after, for 41 estimated candidate tokens saved (11.7816%). This measures candidate size and preservation behavior only. It does not measure provider cost, billed tokens, task quality, or end-to-end model performance.
+
+| Cases | Transformed | Passthrough | Estimated before | Estimated after | Estimated candidate saved |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 14 | 5 | 9 | 348 | 307 | 41 (11.7816%) |
+
+<!-- TGL-BENCHMARK:END -->
+
+Reproduce the result and its README binding:
 
 ```bash
-tgl-mcp-gateway --config ./token-governance.config.json
+python -m benchmarks.run --manifest benchmarks/fixtures/manifest.json --output .tgl/benchmark-v0.2.0.json
+python -m benchmarks.check_readme --results benchmarks/results/v0.2.0.json --readme README.md
+python -m benchmarks.check_readme --results benchmarks/results/v0.2.0.json --readme README.zh-CN.md
 ```
 
-配置示例：
+Methodology, fixture identities, result schema, and limitations are documented in [docs/benchmark.md](docs/benchmark.md).
 
-```json
-{
-  "ledger": {
-    "path": "./.tgl/ledger.sqlite"
-  },
-  "gateway": {
-    "backends": [
-      {
-        "name": "code",
-        "command": "python",
-        "args": ["./path/to/code_mcp_server.py"]
-      },
-      {
-        "name": "docs",
-        "command": "python",
-        "args": ["./path/to/docs_mcp_server.py"]
-      }
-    ]
-  }
-}
-```
+## Compatibility
 
-### 本地开发
+| Component | Supported release line |
+| --- | --- |
+| Operating systems | Windows, macOS, Linux |
+| Python | 3.10, 3.11, 3.12, 3.13, 3.14 |
+| Node.js wrapper | 22, 24 |
+| Primary host | Claude Code project-level `PostToolUse` integration |
+| Storage | Local SQLite; plaintext, current-user permissions |
+| MCP | stdio tools server; protocol `2025-06-18` |
+| Gateway | Experimental, tools only |
+
+## Development
 
 ```bash
 python -m pip install -e .
+python -m pip install pytest pytest-asyncio ruff
 python -m pytest -q
+python -m ruff check src tests benchmarks
+python -m compileall -q src tests benchmarks
 npm pack --dry-run
 ```
 
-本地测试 npm tarball：
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the [Chinese README](README.zh-CN.md).
 
-```powershell
-npm pack
-npm install -g .\token-governance-layer-0.1.0.tgz
-tgl --help
-```
+## License
 
-发布 npm：
-
-```powershell
-npm login
-npm publish --access public
-```
-
-## English
-
-### Problem
-
-Coding agents often feed long command outputs, logs, search results, file
-snippets, and MCP tool schemas back into model context. That wastes tokens and
-makes long tasks more expensive. Token Governance Layer automatically governs
-those payloads, keeps a local receipt, and allows exact restoration when the
-original output is needed.
-
-### Features
-
-- Conservative local governance engine.
-- SQLite receipt ledger with local original-payload storage.
-- Claude Code automatic `PostToolUse` hook.
-- MCP restore and audit tools:
-  - `retrieve_original`
-  - `explain_receipt`
-  - `show_savings`
-  - `list_context_risks`
-- MCP gateway that exposes a compact tool catalog first and full schemas on
-  demand.
-- npm wrapper distribution for simple installation.
-
-### Real Benchmark Data
-
-The data below was collected on 2026-07-09 from real payloads in this
-repository, not synthetic logs. The benchmark used `npm pack --dry-run` output,
-`pytest -q` output, source files, README content, and keyword search results
-across source/tests. Token counts use the built-in deterministic local
-estimator, `token_governance.tokenizer.estimate_tokens`, so the before/after
-comparison is reproducible.
-
-| Sample | Lines | Action | Before tokens | After tokens | Tokens saved | Save rate |
-|---|---:|---|---:|---:|---:|---:|
-| `npm pack --dry-run` package listing | 34 | summarize | 337 | 107 | 230 | 68.25% |
-| `pytest -q` test output | 2 | passthrough | 48 | 48 | 0 | 0.00% |
-| Core governance engine source | 107 | summarize | 591 | 70 | 521 | 88.16% |
-| MCP gateway source | 510 | summarize | 4,182 | 403 | 3,779 | 90.36% |
-| README documentation context | 407 | summarize | 2,070 | 114 | 1,956 | 94.49% |
-| Keyword search results across source/tests | 3 | passthrough | 44 | 44 | 0 | 0.00% |
-
-Summary:
-
-- Total samples: 6
-- Before governance: 7,272 estimated tokens
-- After governance: 786 estimated tokens
-- Total saved: 6,486 estimated tokens
-- Overall save rate: 89.19%
-- Summarized samples: 4; short passthrough samples: 2
-- Risk classification: all 6 samples were `low`
-
-The result shows the intended default behavior: long source files, long
-documentation, and long command outputs shrink aggressively, while short outputs
-pass through unchanged instead of being compressed for cosmetic savings.
-
-### Quick Start With npm
-
-```powershell
-npm install -g token-governance-layer
-cd "<your-project>"
-tgl claude-install --project .
-claude
-```
-
-Without a global install:
-
-```powershell
-cd "<your-project>"
-npx token-governance-layer claude-install --project .
-claude
-```
-
-The npm package exposes:
-
-```text
-tgl
-tgl-mcp
-tgl-mcp-gateway
-tgl-claude-hook
-```
-
-Python 3.10+ must be available on `PATH`. On Windows the wrapper tries `py -3`,
-`python`, then `python3`; on macOS/Linux it tries `python3`, then `python`.
-
-### Claude Code Automatic Governance
-
-Inside a project, run:
-
-```powershell
-tgl claude-install --project .
-```
-
-This writes only project-local configuration:
-
-- `.claude/settings.json` registers the `PostToolUse` hook.
-- `.mcp.json` registers the `token-governance-layer` MCP server for restore and
-  audit.
-- `.tgl/claude-ledger.sqlite` stores local receipts.
-
-Then start Claude Code normally:
-
-```powershell
-claude
-```
-
-No manual `govern_context` call is needed. When Claude Code uses high-output
-tools such as `Bash`, `PowerShell`, `Read`, `Grep`, `Glob`, `LS`, `Task`,
-`WebFetch`, or `WebSearch`, the hook replaces the output only when the governed
-output is shorter and appends a receipt ID.
-
-To restore or inspect the original output, ask Claude to use the MCP tools:
-
-```text
-Use retrieve_original for receipt_id tgl_<id>.
-Use explain_receipt for receipt_id tgl_<id>.
-Use show_savings to show token governance savings.
-```
-
-### CLI
-
-Govern stdin:
-
-```bash
-type long-log.txt | tgl govern --content-type log
-```
-
-Use an explicit ledger:
-
-```bash
-type long-log.txt | tgl --db ./.tgl/ledger.sqlite govern --content-type log --source local-test
-```
-
-Retrieve the original payload:
-
-```bash
-tgl --db ./.tgl/ledger.sqlite retrieve tgl_<receipt_id>
-```
-
-Inspect a receipt:
-
-```bash
-tgl --db ./.tgl/ledger.sqlite inspect tgl_<receipt_id>
-```
-
-Show aggregate savings:
-
-```bash
-tgl --db ./.tgl/ledger.sqlite stats
-```
-
-### MCP Server
-
-Run over stdio:
-
-```bash
-tgl-mcp --db ./.tgl/ledger.sqlite
-```
-
-Example MCP client config:
-
-```json
-{
-  "mcpServers": {
-    "token-governance-layer": {
-      "command": "tgl-mcp",
-      "args": ["--db", "./.tgl/ledger.sqlite"]
-    }
-  }
-}
-```
-
-### MCP Gateway
-
-The gateway wraps one or more backend MCP servers. Clients first see a compact
-tool surface; full backend schemas are loaded on demand.
-
-```bash
-tgl-mcp-gateway --config ./token-governance.config.json
-```
-
-Example config:
-
-```json
-{
-  "ledger": {
-    "path": "./.tgl/ledger.sqlite"
-  },
-  "gateway": {
-    "backends": [
-      {
-        "name": "code",
-        "command": "python",
-        "args": ["./path/to/code_mcp_server.py"]
-      },
-      {
-        "name": "docs",
-        "command": "python",
-        "args": ["./path/to/docs_mcp_server.py"]
-      }
-    ]
-  }
-}
-```
-
-### Development
-
-```bash
-python -m pip install -e .
-python -m pytest -q
-npm pack --dry-run
-```
-
-Test a local npm tarball:
-
-```powershell
-npm pack
-npm install -g .\token-governance-layer-0.1.0.tgz
-tgl --help
-```
-
-Publish to npm:
-
-```powershell
-npm login
-npm publish --access public
-```
-
-### Safety Defaults
-
-- Short payloads pass through unchanged.
-- User instructions, secret-like content, and security-sensitive content are not
-  semantically compressed.
-- Protected lines for errors, assertions, tracebacks, file paths, and failures
-  are preserved.
-- Original content is stored locally and recoverable by receipt ID.
-- Token counts use a deterministic local estimate until model-specific
-  tokenizers are added.
-
+[MIT](LICENSE)

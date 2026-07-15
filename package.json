@@ -1,8 +1,17 @@
 {
   "name": "token-governance-layer",
   "version": "0.1.0",
-  "description": "Local-first token governance layer for coding agents.",
+  "description": "Experimental local-first output governance for Claude Code.",
   "license": "MIT",
+  "author": "Token Governance Layer Contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spacesky-cell/token-governance-layer.git"
+  },
+  "homepage": "https://github.com/spacesky-cell/token-governance-layer#readme",
+  "bugs": {
+    "url": "https://github.com/spacesky-cell/token-governance-layer/issues"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
@@ -20,11 +29,17 @@
     "pyproject.toml",
     "LICENSE",
     "README.md",
-    "token-governance.config.example.json",
-    "token-governance-layer-overall-plan.zh.md"
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "docs/security.md",
+    "docs/benchmark.md",
+    "docs/gateway.md",
+    "token-governance.config.example.json"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22 <25"
   },
   "scripts": {
     "test": "python -m pytest -q",
@@ -32,9 +47,10 @@
   },
   "keywords": [
     "claude-code",
+    "claude-code-hook",
     "mcp",
     "token",
-    "llm",
-    "agent"
+    "context-governance",
+    "local-first"
   ]
 }
