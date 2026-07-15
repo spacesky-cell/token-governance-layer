@@ -1,0 +1,263 @@
+{
+  "aggregate": {
+    "cases": 14,
+    "estimated_tokens_after": 307,
+    "estimated_tokens_before": 348,
+    "estimated_tokens_saved": 41,
+    "reduction_ratio": 0.117816
+  },
+  "cases": [
+    {
+      "action": "transform",
+      "estimated_tokens_after": 38,
+      "estimated_tokens_before": 50,
+      "estimated_tokens_saved": 12,
+      "id": "repetitive_log",
+      "preservation": true,
+      "protected_fact_evidence": [
+        {
+          "sha256": "2f94995195ec38ec452d2b6b6bda1683f0da5405173eca60e2c332c9420b5b56",
+          "text": "service ready\n"
+        }
+      ],
+      "reason_code": "transformed",
+      "risk": "low",
+      "strategy": "repetitive_log"
+    },
+    {
+      "action": "transform",
+      "estimated_tokens_after": 42,
+      "estimated_tokens_before": 46,
+      "estimated_tokens_saved": 4,
+      "id": "test_output",
+      "preservation": true,
+      "protected_fact_evidence": [
+        {
+          "sha256": "10806d145dff9dbf9c631a36ce2b36bf899896ad4d341b686282f1b49711eb60",
+          "text": "3 passed in 0.10s\n"
+        }
+      ],
+      "reason_code": "transformed",
+      "risk": "low",
+      "strategy": "test_output"
+    },
+    {
+      "action": "transform",
+      "estimated_tokens_after": 39,
+      "estimated_tokens_before": 43,
+      "estimated_tokens_saved": 4,
+      "id": "build_output",
+      "preservation": true,
+      "protected_fact_evidence": [
+        {
+          "sha256": "9329a30ffc13862a828505ebd50418e04421c71785c11dc77a7e024c1114927d",
+          "text": "built in 1s\n"
+        }
+      ],
+      "reason_code": "transformed",
+      "risk": "low",
+      "strategy": "build_output"
+    },
+    {
+      "action": "transform",
+      "estimated_tokens_after": 47,
+      "estimated_tokens_before": 61,
+      "estimated_tokens_saved": 14,
+      "id": "protected_middle",
+      "preservation": true,
+      "protected_fact_evidence": [
+        {
+          "sha256": "daa8c22a7171b8f89644c120f0ce9da03c590b8701f8dd3df5049a8d8e1a8b3e",
+          "text": "critical unique fact\n"
+        }
+      ],
+      "reason_code": "transformed",
+      "risk": "low",
+      "strategy": "repetitive_log"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 12,
+      "estimated_tokens_before": 12,
+      "estimated_tokens_saved": 0,
+      "id": "secret_first",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "5a0295a839c0672d0e2368bf42e91647d1c33d33b27515212568f429999802af",
+          "text": "token=synthetic-not-a-secret\n"
+        }
+      ],
+      "reason_code": "secret_detected",
+      "risk": "high",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 10,
+      "estimated_tokens_before": 10,
+      "estimated_tokens_saved": 0,
+      "id": "secret_middle",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "4a273250db28c38be1ebeef26af12776c20dfbe989ee6e617dc92b0a9295cc73",
+          "text": "api_key=synthetic-middle-value\n"
+        }
+      ],
+      "reason_code": "secret_detected",
+      "risk": "high",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 10,
+      "estimated_tokens_before": 10,
+      "estimated_tokens_saved": 0,
+      "id": "secret_end",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "b65fa7b1227e031f92b6c22c8be61469a84e2617e11ae27f43d1a33cfd12671d",
+          "text": "password=synthetic-end-value\n"
+        }
+      ],
+      "reason_code": "secret_detected",
+      "risk": "high",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 7,
+      "estimated_tokens_before": 7,
+      "estimated_tokens_saved": 0,
+      "id": "source_passthrough",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "142c914812a74c4bfa7d4624cfd267b01c120caa936b236a15ad91c984d0b3e0",
+          "text": "def f():\n"
+        },
+        {
+          "sha256": "c75efa0f041a772c118bec449e5e37111795300cdffa507955c18a3e298d55b0",
+          "text": "    return 1\n"
+        }
+      ],
+      "reason_code": "no_matching_strategy",
+      "risk": "unavailable",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 18,
+      "estimated_tokens_before": 18,
+      "estimated_tokens_saved": 0,
+      "id": "json_passthrough",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "ec5cd75b1261ac0372f6f8adbf2fab33450423430d01bd2e964750a97ae29f30",
+          "text": "{\"event\":\"same\"}\n"
+        }
+      ],
+      "reason_code": "no_matching_strategy",
+      "risk": "unavailable",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 5,
+      "estimated_tokens_before": 5,
+      "estimated_tokens_saved": 0,
+      "id": "unicode",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "c46785c7741d1d442862d2cbf77afa62461e5d08291f38203e2323743bd59b50",
+          "text": "完成 ✅\n"
+        }
+      ],
+      "reason_code": "not_smaller",
+      "risk": "medium",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "transform",
+      "estimated_tokens_after": 37,
+      "estimated_tokens_before": 44,
+      "estimated_tokens_saved": 7,
+      "id": "long",
+      "preservation": true,
+      "protected_fact_evidence": [
+        {
+          "sha256": "161069badc0cc23058b13d7c068e45205f4333aa15fd78db9d68f5c9f1ae8983",
+          "text": "finished\n"
+        }
+      ],
+      "reason_code": "transformed",
+      "risk": "low",
+      "strategy": "repetitive_log"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 0,
+      "estimated_tokens_before": 0,
+      "estimated_tokens_saved": 0,
+      "id": "empty",
+      "preservation": false,
+      "protected_fact_evidence": [],
+      "reason_code": "no_matching_strategy",
+      "risk": "unavailable",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 2,
+      "estimated_tokens_before": 2,
+      "estimated_tokens_saved": 0,
+      "id": "malformed",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "583bcd2101e740d7fd21fd279e2f061eaccbfef15890980bb65e23918aaac2a8",
+          "text": "valid text"
+        }
+      ],
+      "reason_code": "malformed_request",
+      "risk": "unavailable",
+      "strategy": "passthrough"
+    },
+    {
+      "action": "passthrough",
+      "estimated_tokens_after": 40,
+      "estimated_tokens_before": 40,
+      "estimated_tokens_saved": 0,
+      "id": "large",
+      "preservation": false,
+      "protected_fact_evidence": [
+        {
+          "sha256": "a5bdf59a2d987ba3c166d1a262d2e985c93a125c408c95889671f5416bf60231",
+          "text": "large fixture line 000\n"
+        },
+        {
+          "sha256": "d2a37480554922c31603c30be525385be867461c4224e7cffe8e91ee16090a59",
+          "text": "large fixture line 009\n"
+        }
+      ],
+      "reason_code": "no_matching_strategy",
+      "risk": "unavailable",
+      "strategy": "passthrough"
+    }
+  ],
+  "environment": {
+    "contract": "portable",
+    "observed": {},
+    "runtime": "stdlib"
+  },
+  "label": "estimated_candidate_microbenchmark",
+  "manifest_sha256": "b1079c4c9fd1fbff2f271a8be078507b3814922826bf2ece95b0e4d3cc8d9064",
+  "methodology": "Local GovernanceEngine microbenchmark with estimated tokenizer counts; no provider billing or task-quality claim.",
+  "schema": "result-v1",
+  "seed": 20260715,
+  "version": "0.2.0"
+}

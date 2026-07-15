@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "seed": 20260715,
+  "cases": [
+    {"id":"repetitive_log","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"tail app.log","stdout":"heartbeat service waiting for worker\nheartbeat service waiting for worker\nheartbeat service waiting for worker\nheartbeat service waiting for worker\nservice ready\n","stderr":"","exit_code":0,"protected_facts":["service ready\n"]},
+    {"id":"test_output","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"pytest -q","stdout":"collecting ...\ncollecting ...\ncollecting ...\n3 passed in 0.10s\n","stderr":"","exit_code":0,"protected_facts":["3 passed in 0.10s\n"]},
+    {"id":"build_output","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"npm run build","stdout":"compiling production bundle modules\ncompiling production bundle modules\ncompiling production bundle modules\nbuilt in 1s\n","stderr":"","exit_code":0,"protected_facts":["built in 1s\n"]},
+    {"id":"protected_middle","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"tail app.log","stdout":"heartbeat service waiting for worker\nheartbeat service waiting for worker\nheartbeat service waiting for worker\ncritical unique fact\ntrailing status details for operator\ntrailing status details for operator\ntrailing status details for operator\n","stderr":"","exit_code":0,"protected_facts":["critical unique fact\n"]},
+    {"id":"secret_first","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"tail app.log","stdout":"token=synthetic-not-a-secret\nheartbeat\nheartbeat\nheartbeat\n","stderr":"","exit_code":0,"protected_facts":["token=synthetic-not-a-secret\n"]},
+    {"id":"secret_middle","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"tail app.log","stdout":"heartbeat\nheartbeat\napi_key=synthetic-middle-value\nheartbeat\n","stderr":"","exit_code":0,"protected_facts":["api_key=synthetic-middle-value\n"]},
+    {"id":"secret_end","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"tail app.log","stdout":"heartbeat\nheartbeat\nheartbeat\npassword=synthetic-end-value\n","stderr":"","exit_code":0,"protected_facts":["password=synthetic-end-value\n"]},
+    {"id":"source_passthrough","source_kind":"cli","mode":"manual","tool_name":null,"command":null,"command_result":false,"raw_text":"def f():\n    return 1\n","protected_facts":["def f():\n","    return 1\n"]},
+    {"id":"json_passthrough","source_kind":"cli","mode":"manual","tool_name":null,"command":null,"command_result":false,"raw_text":"{\"event\":\"same\"}\n{\"event\":\"same\"}\n","protected_facts":["{\"event\":\"same\"}\n"]},
+    {"id":"unicode","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"tail app.log","stdout":"状态\n状态\n状态\n完成 ✅\n","stderr":"","exit_code":0,"protected_facts":["完成 ✅\n"]},
+    {"id":"long","source_kind":"claude_hook","mode":"auto","tool_name":"Bash","command":"tail app.log","stdout":"long-line-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nlong-line-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nlong-line-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nfinished\n","stderr":"","exit_code":0,"protected_facts":["finished\n"]},
+    {"id":"empty","source_kind":"cli","mode":"manual","tool_name":null,"command":null,"command_result":false,"raw_text":"","protected_facts":[]},
+    {"id":"malformed","source_kind":"cli","mode":"manual","tool_name":null,"command":null,"command_result":false,"raw_text":"valid text","payload_bytes":0,"protected_facts":["valid text"]},
+    {"id":"large","source_kind":"cli","mode":"manual","tool_name":null,"command":null,"command_result":false,"raw_text":"large fixture line 000\nlarge fixture line 001\nlarge fixture line 002\nlarge fixture line 003\nlarge fixture line 004\nlarge fixture line 005\nlarge fixture line 006\nlarge fixture line 007\nlarge fixture line 008\nlarge fixture line 009\n","protected_facts":["large fixture line 000\n","large fixture line 009\n"]}
+  ],
+  "integrity_sha256": "b1079c4c9fd1fbff2f271a8be078507b3814922826bf2ece95b0e4d3cc8d9064"
+}

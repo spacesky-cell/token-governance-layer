@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema", "version", "label", "seed", "manifest_sha256", "methodology", "environment", "cases", "aggregate"],
+  "properties": {
+    "schema": {"const": "result-v1"},
+    "version": {"const": "0.2.0"},
+    "label": {"const": "estimated_candidate_microbenchmark"},
+    "seed": {"const": 20260715},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "methodology": {"type": "string"},
+    "environment": {"type": "object", "required": ["contract", "runtime", "observed"]},
+    "cases": {"type": "array", "items": {"type": "object", "required": ["id", "action", "risk", "strategy", "reason_code", "preservation", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "protected_fact_evidence"]}},
+    "aggregate": {"type": "object", "required": ["cases", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "reduction_ratio"]}
+  }
+}
