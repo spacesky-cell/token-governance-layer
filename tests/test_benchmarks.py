@@ -81,6 +81,20 @@ def test_altered_manifest_is_rejected(tmp_path):
     assert "manifest" in (completed.stderr + completed.stdout).lower()
 
 
+@pytest.mark.parametrize("seed", [1, True])
+def test_manifest_seed_is_fixed_and_not_boolean(tmp_path, seed):
+    data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    data["seed"] = seed
+    data.pop("integrity_sha256", None)
+    canonical = (json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+    data["integrity_sha256"] = hashlib.sha256(canonical).hexdigest()
+    altered = tmp_path / "manifest.json"
+    altered.write_text(json.dumps(data), encoding="utf-8")
+    completed = run_benchmark(manifest=altered, output=tmp_path / "result.json")
+    assert completed.returncode != 0
+    assert "seed" in (completed.stderr + completed.stdout).lower()
+
+
 def test_checker_extracts_markers_and_rejects_drift(tmp_path):
     from benchmarks.check_readme import check_readme
     digest = hashlib.sha256(RESULT.read_bytes()).hexdigest()
@@ -123,6 +137,28 @@ def test_mutated_protected_evidence_is_rejected():
 
     data = json.loads(RESULT.read_text(encoding="utf-8"))
     data["cases"][0]["protected_fact_evidence"] = []
+    assert validate_result(data)
+
+
+@pytest.mark.parametrize("mutation", ["remove", "duplicate", "extra"])
+def test_result_case_ids_must_exactly_match_manifest(mutation):
+    from benchmarks.run import validate_result
+
+    data = json.loads(RESULT.read_text(encoding="utf-8"))
+    if mutation == "remove":
+        data["cases"].pop()
+    elif mutation == "duplicate":
+        data["cases"][-1]["id"] = data["cases"][0]["id"]
+    else:
+        extra = dict(data["cases"][0])
+        extra["id"] = "unexpected"
+        data["cases"].append(extra)
+    data["aggregate"]["cases"] = len(data["cases"])
+    data["aggregate"]["estimated_tokens_before"] = sum(item["estimated_tokens_before"] for item in data["cases"])
+    data["aggregate"]["estimated_tokens_after"] = sum(item["estimated_tokens_after"] for item in data["cases"])
+    data["aggregate"]["estimated_tokens_saved"] = sum(item["estimated_tokens_saved"] for item in data["cases"])
+    before = data["aggregate"]["estimated_tokens_before"]
+    data["aggregate"]["reduction_ratio"] = round(data["aggregate"]["estimated_tokens_saved"] / before, 6) if before else 0.0
     assert validate_result(data)
 
 

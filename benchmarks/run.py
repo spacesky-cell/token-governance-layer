@@ -35,6 +35,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError(f"manifest could not be read: {exc}") from exc
     if not isinstance(manifest, dict) or manifest.get("version") != 1:
         raise ValueError("manifest version is unsupported")
+    seed = manifest.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed != SEED:
+        raise ValueError("manifest seed is invalid")
     expected = manifest.get("integrity_sha256")
     if not isinstance(expected, str) or expected != manifest_digest(manifest):
         raise ValueError("manifest integrity check failed")
@@ -132,7 +135,7 @@ def run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "schema": SCHEMA_VERSION,
         "version": "0.2.0",
         "label": LABEL,
-        "seed": SEED,
+        "seed": manifest["seed"],
         "manifest_sha256": manifest_digest(manifest),
         "methodology": "Local GovernanceEngine microbenchmark with estimated tokenizer counts; no provider billing or task-quality claim.",
         "environment": {"contract": "portable", "runtime": "stdlib", "observed": {}},
@@ -214,6 +217,8 @@ def validate_result(data: Any, *, manifest: dict[str, Any] | None = None) -> lis
         errors.append("invalid seed")
     if manifest is not None and data.get("manifest_sha256") != manifest_digest(manifest):
         errors.append("manifest digest mismatch")
+    if manifest is not None and data.get("seed") != manifest.get("seed"):
+        errors.append("result seed does not match manifest")
     if not isinstance(data.get("methodology"), str) or not data.get("methodology"):
         errors.append("invalid methodology")
     if not isinstance(data.get("cases"), list):
@@ -276,6 +281,10 @@ def validate_result(data: Any, *, manifest: dict[str, Any] | None = None) -> lis
                             errors.append(f"case {index} protected evidence mismatch")
         if len(ids) != len(set(ids)):
             errors.append("case ids must be unique")
+        if manifest is not None:
+            expected_ids = {item.get("id") for item in manifest.get("cases", [])}
+            if len(ids) != len(expected_ids) or set(ids) != expected_ids:
+                errors.append("result case ids do not exactly match manifest")
         aggregate = data.get("aggregate")
         if isinstance(aggregate, dict):
             if aggregate.get("cases") != len(data["cases"]):
