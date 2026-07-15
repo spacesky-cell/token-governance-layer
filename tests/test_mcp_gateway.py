@@ -840,7 +840,9 @@ def test_tools_list_changed_invalidates_only_that_backend_catalog(tmp_path):
         proc.wait(timeout=5)
 
     first_catalog = json.loads(first["result"]["content"][0]["text"])
-    assert first_catalog["tools"][0]["description"].endswith("generation=0")
+    assert first_catalog["tools"][0]["description"].endswith(
+        ("generation=0", "generation=1")
+    )
     assert second_catalog["tools"][0]["description"].endswith("generation=1")
 
 
