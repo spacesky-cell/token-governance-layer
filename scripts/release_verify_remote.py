@@ -121,6 +121,33 @@ def _registry_install(version: str, root: Path) -> bool:
         return result.returncode == 0 and "claude-install" in result.stdout
 
 
+def _query_registry_metadata(version: str, root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="tgl-registry-metadata-") as directory:
+        npm_env = _isolated_npm_env(Path(directory))
+        metadata_result = run(
+            ["npm", "view", f"{PACKAGE_NAME}@{version}", "--json", "--registry", OFFICIAL_REGISTRY],
+            cwd=root,
+            env=npm_env,
+            timeout=60,
+        )
+        tags_result = run(
+            ["npm", "view", PACKAGE_NAME, "dist-tags", "--json", "--registry", OFFICIAL_REGISTRY],
+            cwd=root,
+            env=npm_env,
+            timeout=60,
+        )
+        if metadata_result.returncode != 0 or tags_result.returncode != 0:
+            raise ReleaseError("npm metadata unavailable")
+        try:
+            metadata = json.loads(metadata_result.stdout)
+            tags = json.loads(tags_result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ReleaseError("npm metadata was not valid JSON") from exc
+        if not isinstance(metadata, dict) or not isinstance(tags, dict):
+            raise ReleaseError("npm metadata shape was invalid")
+        return metadata, tags
+
+
 def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: Path, *, root: Path = ROOT) -> int:
     validate_version(version)
     expected_sha = validate_sha(expected_sha)
@@ -174,12 +201,7 @@ def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: 
         )
     npm_meta: dict[str, Any] = {}
     try:
-        with tempfile.TemporaryDirectory(prefix="tgl-registry-metadata-") as directory:
-            npm_env = _isolated_npm_env(Path(directory))
-            npm_result = run(["npm", "view", f"{PACKAGE_NAME}@{version}", "--json", "--registry", OFFICIAL_REGISTRY], env=npm_env, timeout=60)
-        if npm_result.returncode != 0:
-            raise ReleaseError("npm metadata unavailable")
-        npm_meta = json.loads(npm_result.stdout)
+        npm_meta, latest_value = _query_registry_metadata(version, root)
         dist = npm_meta.get("dist", {}) if isinstance(npm_meta, dict) else {}
         checks.append(check("npm_version", npm_meta.get("version") == version, "npm package version matches"))
         checks.append(check("npm_git_head", npm_meta.get("gitHead") == expected_sha, "npm gitHead matches frozen SHA"))
@@ -192,8 +214,6 @@ def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: 
         checks.append(check("npm_integrity", integrity == actual_integrity, "npm integrity matches registry tarball"))
         downloaded_hash = hashlib.sha256(downloaded).hexdigest()
         checks.append(check("npm_tarball_hash", downloaded_hash == tarball_sha256, "registry tarball SHA-256 matches recorded artifact"))
-        latest = run(["npm", "view", PACKAGE_NAME, "dist-tags", "--json", "--registry", OFFICIAL_REGISTRY], env=npm_env, timeout=60)
-        latest_value = json.loads(latest.stdout) if latest.returncode == 0 else {}
         checks.append(check("npm_latest", isinstance(latest_value, dict) and latest_value.get("latest") == version, "npm latest dist-tag matches release"))
         checks.append(check("npm_registry_install", _registry_install(version, root), "clean registry install and help smoke"))
     except (ReleaseError, json.JSONDecodeError):

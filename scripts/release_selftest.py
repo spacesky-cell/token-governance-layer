@@ -16,7 +16,7 @@ from release_common import (
     validate_version,
 )
 from release_check import _github_auth_checks, _tag_absent
-from release_verify_remote import OFFICIAL_REGISTRY, _isolated_npm_env
+from release_verify_remote import OFFICIAL_REGISTRY, _isolated_npm_env, _query_registry_metadata
 from release_build_package import build_package
 from release_check import validate_publish_evidence
 from release_set_version import VersionUpdateError, set_version
@@ -168,6 +168,26 @@ class ReleaseEvidenceTests(unittest.TestCase):
             self.assertEqual(environment["NPM_CONFIG_STRICT_SSL"], "true")
             self.assertNotIn("NPM_TOKEN", environment)
             self.assertTrue(Path(environment["NPM_CONFIG_USERCONFIG"]).read_text() == "")
+
+    def test_registry_metadata_queries_share_live_isolated_configs(self) -> None:
+        observed: list[tuple[str, str]] = []
+
+        def fake_run(command, *, env, **_kwargs):
+            user = Path(env["NPM_CONFIG_USERCONFIG"])
+            global_config = Path(env["NPM_CONFIG_GLOBALCONFIG"])
+            observed.append((str(user), str(global_config)))
+            self.assertTrue(user.is_file() and user.read_text() == "")
+            self.assertTrue(global_config.is_file() and global_config.read_text() == "")
+            self.assertEqual(env["NPM_CONFIG_REGISTRY"], OFFICIAL_REGISTRY)
+            payload = {"version": "0.2.0", "dist": {}} if "dist-tags" not in command else {"latest": "0.2.0"}
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+        with mock.patch("release_verify_remote.clean_network_env", return_value={"PATH": "safe"}), mock.patch("release_verify_remote.run", side_effect=fake_run):
+            metadata, tags = _query_registry_metadata("0.2.0", Path("."))
+        self.assertEqual(metadata["version"], "0.2.0")
+        self.assertEqual(tags["latest"], "0.2.0")
+        self.assertEqual(len(observed), 2)
+        self.assertTrue(all(not Path(path).exists() for pair in observed for path in pair))
 
     def test_builder_rejects_prepare_lifecycle_tracked_file_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
