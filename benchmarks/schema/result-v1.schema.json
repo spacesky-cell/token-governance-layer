@@ -2,15 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "required": ["schema", "version", "label", "seed", "manifest_sha256", "methodology", "environment", "cases", "aggregate"],
+  "additionalProperties": false,
   "properties": {
     "schema": {"const": "result-v1"},
     "version": {"const": "0.2.0"},
     "label": {"const": "estimated_candidate_microbenchmark"},
     "seed": {"const": 20260715},
     "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "methodology": {"type": "string"},
-    "environment": {"type": "object", "required": ["contract", "runtime", "observed"]},
-    "cases": {"type": "array", "items": {"type": "object", "required": ["id", "action", "risk", "strategy", "reason_code", "preservation", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "protected_fact_evidence"]}},
-    "aggregate": {"type": "object", "required": ["cases", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "reduction_ratio"]}
+    "methodology": {"type": "string", "minLength": 1},
+    "environment": {"type": "object", "required": ["contract", "runtime", "observed"], "additionalProperties": false, "properties": {"contract": {"const": "portable"}, "runtime": {"const": "stdlib"}, "observed": {"type": "object"}}},
+    "cases": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["id", "action", "risk", "strategy", "reason_code", "preservation", "engine_preservation", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "protected_fact_evidence", "receipt_created"], "properties": {"id": {"type": "string", "minLength": 1}, "action": {"enum": ["passthrough", "transform"]}, "risk": {"enum": ["low", "medium", "high", "unavailable"]}, "strategy": {"enum": ["passthrough", "repetitive_log", "test_output", "build_output"]}, "reason_code": {"enum": ["transformed", "strategy_matched", "no_matching_strategy", "ambiguous_strategy", "strategy_disabled", "protected_content", "secret_detected", "payload_too_large", "original_too_large", "deadline_exceeded", "malformed_request", "config_invalid", "shaper_failed", "preservation_passed", "preservation_failed", "not_smaller", "ledger_failed", "serialization_failed", "classification_unavailable"]}, "preservation": {"type": "boolean", "const": true}, "engine_preservation": {"type": "boolean"}, "estimated_tokens_before": {"type": "integer", "minimum": 0}, "estimated_tokens_after": {"type": "integer", "minimum": 0}, "estimated_tokens_saved": {"type": "integer", "minimum": 0}, "protected_fact_evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["text", "sha256"], "properties": {"text": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}}, "receipt_created": {"type": "boolean"}}}},
+    "aggregate": {"type": "object", "additionalProperties": false, "required": ["cases", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "reduction_ratio"], "properties": {"cases": {"type": "integer", "minimum": 1}, "estimated_tokens_before": {"type": "integer", "minimum": 0}, "estimated_tokens_after": {"type": "integer", "minimum": 0}, "estimated_tokens_saved": {"type": "integer", "minimum": 0}, "reduction_ratio": {"type": "number", "minimum": 0}}}
   }
 }

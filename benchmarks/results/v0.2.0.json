@@ -9,6 +9,7 @@
   "cases": [
     {
       "action": "transform",
+      "engine_preservation": true,
       "estimated_tokens_after": 38,
       "estimated_tokens_before": 50,
       "estimated_tokens_saved": 12,
@@ -21,11 +22,13 @@
         }
       ],
       "reason_code": "transformed",
+      "receipt_created": true,
       "risk": "low",
       "strategy": "repetitive_log"
     },
     {
       "action": "transform",
+      "engine_preservation": true,
       "estimated_tokens_after": 42,
       "estimated_tokens_before": 46,
       "estimated_tokens_saved": 4,
@@ -38,11 +41,13 @@
         }
       ],
       "reason_code": "transformed",
+      "receipt_created": true,
       "risk": "low",
       "strategy": "test_output"
     },
     {
       "action": "transform",
+      "engine_preservation": true,
       "estimated_tokens_after": 39,
       "estimated_tokens_before": 43,
       "estimated_tokens_saved": 4,
@@ -55,11 +60,13 @@
         }
       ],
       "reason_code": "transformed",
+      "receipt_created": true,
       "risk": "low",
       "strategy": "build_output"
     },
     {
       "action": "transform",
+      "engine_preservation": true,
       "estimated_tokens_after": 47,
       "estimated_tokens_before": 61,
       "estimated_tokens_saved": 14,
@@ -72,16 +79,18 @@
         }
       ],
       "reason_code": "transformed",
+      "receipt_created": true,
       "risk": "low",
       "strategy": "repetitive_log"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 12,
       "estimated_tokens_before": 12,
       "estimated_tokens_saved": 0,
       "id": "secret_first",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "5a0295a839c0672d0e2368bf42e91647d1c33d33b27515212568f429999802af",
@@ -89,16 +98,18 @@
         }
       ],
       "reason_code": "secret_detected",
+      "receipt_created": false,
       "risk": "high",
       "strategy": "passthrough"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 10,
       "estimated_tokens_before": 10,
       "estimated_tokens_saved": 0,
       "id": "secret_middle",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "4a273250db28c38be1ebeef26af12776c20dfbe989ee6e617dc92b0a9295cc73",
@@ -106,16 +117,18 @@
         }
       ],
       "reason_code": "secret_detected",
+      "receipt_created": false,
       "risk": "high",
       "strategy": "passthrough"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 10,
       "estimated_tokens_before": 10,
       "estimated_tokens_saved": 0,
       "id": "secret_end",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "b65fa7b1227e031f92b6c22c8be61469a84e2617e11ae27f43d1a33cfd12671d",
@@ -123,16 +136,18 @@
         }
       ],
       "reason_code": "secret_detected",
+      "receipt_created": false,
       "risk": "high",
       "strategy": "passthrough"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 7,
       "estimated_tokens_before": 7,
       "estimated_tokens_saved": 0,
       "id": "source_passthrough",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "142c914812a74c4bfa7d4624cfd267b01c120caa936b236a15ad91c984d0b3e0",
@@ -144,16 +159,18 @@
         }
       ],
       "reason_code": "no_matching_strategy",
+      "receipt_created": false,
       "risk": "unavailable",
       "strategy": "passthrough"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 18,
       "estimated_tokens_before": 18,
       "estimated_tokens_saved": 0,
       "id": "json_passthrough",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "ec5cd75b1261ac0372f6f8adbf2fab33450423430d01bd2e964750a97ae29f30",
@@ -161,16 +178,18 @@
         }
       ],
       "reason_code": "no_matching_strategy",
+      "receipt_created": false,
       "risk": "unavailable",
       "strategy": "passthrough"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 5,
       "estimated_tokens_before": 5,
       "estimated_tokens_saved": 0,
       "id": "unicode",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "c46785c7741d1d442862d2cbf77afa62461e5d08291f38203e2323743bd59b50",
@@ -178,11 +197,13 @@
         }
       ],
       "reason_code": "not_smaller",
+      "receipt_created": false,
       "risk": "medium",
       "strategy": "passthrough"
     },
     {
       "action": "transform",
+      "engine_preservation": true,
       "estimated_tokens_after": 37,
       "estimated_tokens_before": 44,
       "estimated_tokens_saved": 7,
@@ -195,28 +216,32 @@
         }
       ],
       "reason_code": "transformed",
+      "receipt_created": true,
       "risk": "low",
       "strategy": "repetitive_log"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 0,
       "estimated_tokens_before": 0,
       "estimated_tokens_saved": 0,
       "id": "empty",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [],
       "reason_code": "no_matching_strategy",
+      "receipt_created": false,
       "risk": "unavailable",
       "strategy": "passthrough"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 2,
       "estimated_tokens_before": 2,
       "estimated_tokens_saved": 0,
       "id": "malformed",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "583bcd2101e740d7fd21fd279e2f061eaccbfef15890980bb65e23918aaac2a8",
@@ -224,16 +249,18 @@
         }
       ],
       "reason_code": "malformed_request",
+      "receipt_created": false,
       "risk": "unavailable",
       "strategy": "passthrough"
     },
     {
       "action": "passthrough",
+      "engine_preservation": false,
       "estimated_tokens_after": 40,
       "estimated_tokens_before": 40,
       "estimated_tokens_saved": 0,
       "id": "large",
-      "preservation": false,
+      "preservation": true,
       "protected_fact_evidence": [
         {
           "sha256": "a5bdf59a2d987ba3c166d1a262d2e985c93a125c408c95889671f5416bf60231",
@@ -245,6 +272,7 @@
         }
       ],
       "reason_code": "no_matching_strategy",
+      "receipt_created": false,
       "risk": "unavailable",
       "strategy": "passthrough"
     }
@@ -255,7 +283,7 @@
     "runtime": "stdlib"
   },
   "label": "estimated_candidate_microbenchmark",
-  "manifest_sha256": "b1079c4c9fd1fbff2f271a8be078507b3814922826bf2ece95b0e4d3cc8d9064",
+  "manifest_sha256": "9ff13c9b7b5d3895823da659892958c4fc98abd8b5486c8d46e0c261eb18917d",
   "methodology": "Local GovernanceEngine microbenchmark with estimated tokenizer counts; no provider billing or task-quality claim.",
   "schema": "result-v1",
   "seed": 20260715,

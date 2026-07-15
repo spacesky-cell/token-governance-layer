@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).parents[1]
 MANIFEST = ROOT / "benchmarks" / "fixtures" / "manifest.json"
 RESULT = ROOT / "benchmarks" / "results" / "v0.2.0.json"
@@ -50,6 +52,14 @@ def test_canonical_result_validates_and_has_protected_evidence():
     assert data["label"] == "estimated_candidate_microbenchmark"
     assert data["aggregate"]["cases"] == len(data["cases"])
     assert all("protected_fact_evidence" in case for case in data["cases"])
+    for case in data["cases"]:
+        assert case["preservation"] is True
+        assert case["receipt_created"] is (case["action"] == "transform")
+    for case_id in ("secret_first", "secret_middle", "secret_end"):
+        case = next(item for item in data["cases"] if item["id"] == case_id)
+        assert case["action"] == "passthrough"
+        assert case["reason_code"] == "secret_detected"
+        assert case["receipt_created"] is False
 
 
 def test_canonical_command_is_byte_stable(tmp_path):
@@ -93,3 +103,32 @@ def test_schema_rejects_missing_case_field():
     data = json.loads(RESULT.read_text(encoding="utf-8"))
     del data["cases"][0]["action"]
     assert validate_result(data)
+
+
+@pytest.mark.parametrize("field,value", [("version", "9.9.9"), ("seed", 1), ("manifest_sha256", "0" * 64), ("methodology", ""), ("environment", {}), ("reason_code", "bogus"), ("preservation", False), ("receipt_created", True)])
+def test_schema_and_manifest_contract_reject_mutated_fields(field, value):
+    from benchmarks.run import validate_result
+
+    data = json.loads(RESULT.read_text(encoding="utf-8"))
+    if field in {"version", "seed", "manifest_sha256", "methodology", "environment"}:
+        data[field] = value
+    else:
+        target = 0 if field != "receipt_created" else next(i for i, item in enumerate(data["cases"]) if item["id"] == "secret_first")
+        data["cases"][target][field] = value
+    assert validate_result(data)
+
+
+def test_mutated_protected_evidence_is_rejected():
+    from benchmarks.run import validate_result
+
+    data = json.loads(RESULT.read_text(encoding="utf-8"))
+    data["cases"][0]["protected_fact_evidence"] = []
+    assert validate_result(data)
+
+
+def test_actual_output_missing_fact_fails_evidence_extraction():
+    from benchmarks.run import _evidence
+
+    case = {"id": "x", "protected_facts": ["critical\n"]}
+    with pytest.raises(ValueError, match="protected fact missing"):
+        _evidence(case, "rewritten\n")

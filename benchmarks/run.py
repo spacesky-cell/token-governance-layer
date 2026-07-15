@@ -15,6 +15,7 @@ from token_governance.ledger import ContextLedger
 SEED = 20260715
 SCHEMA_VERSION = "result-v1"
 LABEL = "estimated_candidate_microbenchmark"
+SCHEMA_PATH = Path(__file__).parent / "schema" / "result-v1.schema.json"
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -76,15 +77,18 @@ def _request(case: dict[str, Any]) -> GovernanceRequest:
     )
 
 
-def _evidence(case: dict[str, Any]) -> list[dict[str, str]]:
+def _evidence(case: dict[str, Any], content: str) -> list[dict[str, str]]:
     values = case.get("protected_facts", [])
     if not isinstance(values, list):
         raise ValueError(f"protected_facts for {case.get('id')} must be a list")
-    return [
-        {"text": value, "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()}
-        for value in values
-        if isinstance(value, str)
-    ]
+    evidence = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"protected fact for {case.get('id')} must be a string")
+        if value not in content:
+            raise ValueError(f"protected fact missing from governed output: {case.get('id')}")
+        evidence.append({"text": value, "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()})
+    return evidence
 
 
 def run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -95,8 +99,15 @@ def run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         for case in manifest["cases"]:
             request = _request(case)
             result = engine.govern_request(request)
-            if result.receipt_id:
+            receipt_created = result.receipt_id is not None
+            expected = case.get("expect")
+            if not isinstance(expected, dict):
+                raise ValueError(f"missing expectation for {case['id']}")
+            if result.action.value != expected.get("action") or result.reason_code.value != expected.get("reason_code") or receipt_created != expected.get("receipt_created"):
+                raise ValueError(f"governance expectation failed: {case['id']}")
+            if receipt_created:
                 ledger.mark_emitted(result.receipt_id)
+            evidence = _evidence(case, result.content)
             before = result.token_before
             after = result.token_after
             rows.append(
@@ -106,11 +117,13 @@ def run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                     "risk": result.risk.value,
                     "strategy": result.strategy.value,
                     "reason_code": result.reason_code.value,
-                    "preservation": bool(result.preservation_check and result.preservation_check.ok),
+                    "preservation": bool(evidence == _evidence(case, result.content)),
+                    "engine_preservation": bool(result.preservation_check and result.preservation_check.ok),
                     "estimated_tokens_before": before,
                     "estimated_tokens_after": after,
                     "estimated_tokens_saved": before - after,
-                    "protected_fact_evidence": _evidence(case),
+                    "protected_fact_evidence": evidence,
+                    "receipt_created": receipt_created,
                 }
             )
     total_before = sum(item["estimated_tokens_before"] for item in rows)
@@ -134,8 +147,60 @@ def run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_result(data: Any) -> list[str]:
+def _schema_type(value: Any, expected: str) -> bool:
+    return {"object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str), "boolean": isinstance(value, bool), "integer": isinstance(value, int) and not isinstance(value, bool), "number": isinstance(value, (int, float)) and not isinstance(value, bool)}.get(expected, True)
+
+
+def _schema_errors(value: Any, schema: dict[str, Any], path: str = "$",) -> list[str]:
     errors: list[str] = []
+    if "type" in schema and not _schema_type(value, schema["type"]):
+        return [f"{path}: expected {schema['type']}"]
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{path}: const mismatch")
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path}: enum mismatch")
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0):
+            errors.append(f"{path}: shorter than minLength")
+        if "pattern" in schema:
+            import re
+            if re.fullmatch(schema["pattern"], value) is None:
+                errors.append(f"{path}: pattern mismatch")
+    if isinstance(value, (int, float)) and value < schema.get("minimum", value):
+        errors.append(f"{path}: below minimum")
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            errors.append(f"{path}: fewer than minItems")
+        if isinstance(schema.get("items"), dict):
+            for i, item in enumerate(value):
+                errors.extend(_schema_errors(item, schema["items"], f"{path}[{i}]"))
+    if isinstance(value, dict):
+        for key in schema.get("required", []):
+            if key not in value:
+                errors.append(f"{path}: missing {key}")
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            for key in value:
+                if key not in properties:
+                    errors.append(f"{path}: unexpected {key}")
+        for key, child in properties.items():
+            if key in value:
+                errors.extend(_schema_errors(value[key], child, f"{path}.{key}"))
+    return errors
+
+
+def validate_result(data: Any, *, manifest: dict[str, Any] | None = None) -> list[str]:
+    errors: list[str] = []
+    if manifest is None:
+        try:
+            manifest = load_manifest(Path(__file__).parent / "fixtures" / "manifest.json")
+        except ValueError:
+            manifest = None
+    try:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        errors.extend(_schema_errors(data, schema))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"schema unavailable: {exc}")
     if not isinstance(data, dict):
         return ["result must be an object"]
     for key in ("schema", "version", "label", "seed", "manifest_sha256", "methodology", "environment", "cases", "aggregate"):
@@ -145,10 +210,16 @@ def validate_result(data: Any) -> list[str]:
         errors.append("unsupported schema")
     if data.get("label") != LABEL:
         errors.append("invalid label")
+    if data.get("seed") != SEED:
+        errors.append("invalid seed")
+    if manifest is not None and data.get("manifest_sha256") != manifest_digest(manifest):
+        errors.append("manifest digest mismatch")
+    if not isinstance(data.get("methodology"), str) or not data.get("methodology"):
+        errors.append("invalid methodology")
     if not isinstance(data.get("cases"), list):
         errors.append("cases must be a list")
     else:
-        required = {"id", "action", "risk", "strategy", "reason_code", "preservation", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "protected_fact_evidence"}
+        required = {"id", "action", "risk", "strategy", "reason_code", "preservation", "engine_preservation", "estimated_tokens_before", "estimated_tokens_after", "estimated_tokens_saved", "protected_fact_evidence", "receipt_created"}
         ids: list[str] = []
         before_total = after_total = saved_total = 0
         for index, case in enumerate(data["cases"]):
@@ -180,6 +251,10 @@ def validate_result(data: Any) -> list[str]:
                     errors.append(f"case {index} strategy is invalid")
                 if not isinstance(case.get("preservation"), bool):
                     errors.append(f"case {index} preservation is invalid")
+                if case.get("preservation") is not True:
+                    errors.append(f"case {index} preservation failed")
+                if not isinstance(case.get("receipt_created"), bool):
+                    errors.append(f"case {index} receipt_created is invalid")
                 evidence = case.get("protected_fact_evidence")
                 if not isinstance(evidence, list):
                     errors.append(f"case {index} protected evidence is invalid")
@@ -187,6 +262,18 @@ def validate_result(data: Any) -> list[str]:
                     for item in evidence:
                         if not isinstance(item, dict) or not isinstance(item.get("text"), str) or item.get("sha256") != hashlib.sha256(item["text"].encode("utf-8")).hexdigest():
                             errors.append(f"case {index} protected evidence is invalid")
+                if manifest is not None and isinstance(case_id, str):
+                    expected_case = next((item for item in manifest["cases"] if item.get("id") == case_id), None)
+                    if expected_case is None:
+                        errors.append(f"case {index} is not in manifest")
+                    else:
+                        expected = expected_case.get("expect", {})
+                        if case.get("action") != expected.get("action") or case.get("reason_code") != expected.get("reason_code") or case.get("receipt_created") != expected.get("receipt_created"):
+                            errors.append(f"case {index} governance expectation mismatch")
+                        expected_facts = expected_case.get("protected_facts", [])
+                        actual_texts = [item.get("text") for item in evidence] if isinstance(evidence, list) else []
+                        if actual_texts != expected_facts:
+                            errors.append(f"case {index} protected evidence mismatch")
         if len(ids) != len(set(ids)):
             errors.append("case ids must be unique")
         aggregate = data.get("aggregate")
@@ -207,8 +294,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
-        result = run_manifest(load_manifest(args.manifest))
-        errors = validate_result(result)
+        loaded_manifest = load_manifest(args.manifest)
+        result = run_manifest(loaded_manifest)
+        errors = validate_result(result, manifest=loaded_manifest)
         if errors:
             raise ValueError("result validation failed: " + "; ".join(errors))
         args.output.parent.mkdir(parents=True, exist_ok=True)
