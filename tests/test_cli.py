@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ def run_cli(args, input_text=None, *, env_overrides=None):
         [sys.executable, "-m", "token_governance.cli", *args],
         input=input_text,
         text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
         env=env,
@@ -51,8 +53,12 @@ def fake_global_install_env(tmp_path):
                 encoding="utf-8",
             )
         else:
+            target = package_root / "bin" / script
+            target.chmod(
+                target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
             shim = shim_dir / name
-            shim.symlink_to(package_root / "bin" / script)
+            shim.symlink_to(target)
     return {
         "PYTHONPATH": str(package_root / "src"),
         "TGL_NPM_WRAPPER": "1",
@@ -285,6 +291,18 @@ def test_cli_init_creates_config_once_without_overwriting_user_values(tmp_path):
     assert json.loads(first.stdout)["created"] is True
     assert json.loads(second.stdout)["created"] is False
     assert config_path.read_bytes() == customized
+
+
+def test_cli_forces_utf8_output_when_inherited_encoding_cannot_encode_project(tmp_path):
+    project = tmp_path / "项目 with spaces"
+
+    result = run_cli(
+        ["init", "--project", str(project)],
+        env_overrides={"PYTHONIOENCODING": "cp1252"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["project"] == str(project.resolve())
 
 
 def test_cli_claude_install_rejects_unproven_source_before_project_mutation(tmp_path):

@@ -18,6 +18,7 @@ from . import __version__
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18",)
 DEFAULT_RETRIEVE_MAX_CHARS = 4096
 MAX_RETRIEVE_MAX_CHARS = 16384
+MAX_JSON_NESTING = 128
 GOVERN_MIGRATION_GUIDANCE = (
     "content_type/source were removed; use strategy "
     "auto|repetitive_log|test_output|build_output"
@@ -93,12 +94,15 @@ class McpServer:
                 line = line.strip().lstrip("\ufeff")
                 if not line:
                     continue
-                try:
-                    request = json.loads(line)
-                except (ValueError, RecursionError):
+                if not _json_nesting_within_limit(line):
                     response = _error(None, -32700, "Parse error")
                 else:
-                    response = self.handle(request)
+                    try:
+                        request = json.loads(line)
+                    except (ValueError, RecursionError):
+                        response = _error(None, -32700, "Parse error")
+                    else:
+                        response = self.handle(request)
             if response is None:
                 continue
             stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
@@ -379,6 +383,30 @@ def _validate_tool_call_params(params: Any) -> dict[str, Any]:
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _json_nesting_within_limit(value: str) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_JSON_NESTING:
+                return False
+        elif character in "]}":
+            depth = max(0, depth - 1)
+    return True
 
 
 def _validate_tool_arguments(name: str, arguments: dict[str, Any]) -> str | None:

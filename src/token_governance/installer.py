@@ -262,6 +262,7 @@ def _expand_windows_shim_path(value: str, shim: Path) -> Path | None:
     )
     if "%" in expanded:
         return None
+    expanded = expanded.replace("\\", os.sep)
     return Path(expanded)
 
 

@@ -326,6 +326,33 @@ def test_too_deep_json_is_a_safe_parse_error_and_server_continues(tmp_path):
     assert "private-payload" not in proc.stdout + proc.stderr
 
 
+def test_json_above_supported_nesting_is_rejected_before_runtime_parser_limits(tmp_path):
+    nested_json = "[" * 129 + "null" + "]" * 129
+
+    proc, responses = run_session(tmp_path, [], raw_input=nested_json + "\n")
+
+    assert proc.returncode == 0, proc.stderr
+    assert responses == [
+        {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        }
+    ]
+
+
+def test_json_depth_guard_ignores_brackets_and_escaped_quotes_inside_strings(tmp_path):
+    client_name = "[" * 200 + r' escaped \" quote { still-string ' + "]" * 200
+    request = initialize_request()
+    request["params"]["clientInfo"]["name"] = client_name
+
+    proc, responses = run_session(tmp_path, [request])
+
+    assert proc.returncode == 0, proc.stderr
+    assert responses[0]["id"] == 1
+    assert responses[0]["result"]["protocolVersion"] == PROTOCOL_VERSION
+
+
 def test_huge_integer_json_is_a_safe_parse_error_and_server_continues(tmp_path):
     huge_id = "9" * 5000
     private_payload = "private-huge-integer-payload"

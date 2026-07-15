@@ -605,6 +605,8 @@ class McpGateway:
             backend.timeout_seconds = request_timeout_seconds
             backend.on_notification = self._on_backend_notification
         self._tools: dict[str, list[dict[str, Any]]] = {}
+        self._tools_lock = threading.Lock()
+        self._tool_revisions = {name: 0 for name in self.backends}
         self._state = GatewayState.CREATED
         self._upstream_pending: dict[Any, tuple[str, int]] = {}
         self._current_upstream = threading.local()
@@ -766,7 +768,11 @@ class McpGateway:
 
     def _on_backend_notification(self, backend_name: str, message: dict[str, Any]) -> None:
         if message.get("method") == "notifications/tools/list_changed":
-            self._tools.pop(backend_name, None)
+            with self._tools_lock:
+                self._tool_revisions[backend_name] = (
+                    self._tool_revisions.get(backend_name, 0) + 1
+                )
+                self._tools.pop(backend_name, None)
 
     def close(self) -> None:
         if self._state in {GatewayState.CLOSING, GatewayState.CLOSED}:
@@ -858,13 +864,25 @@ class McpGateway:
         backend = self.backends[backend_name]
         if backend.state is not BackendState.ACTIVE:
             return []
-        if backend_name not in self._tools:
+        deadline = time.monotonic() + self.request_timeout_seconds
+        while True:
+            with self._tools_lock:
+                cached = self._tools.get(backend_name)
+                revision = self._tool_revisions.get(backend_name, 0)
+            if cached is not None:
+                return cached
             result = backend.request("tools/list", request_id_observer=request_id_observer)
             tools = result.get("tools", [])
             if not isinstance(tools, list):
                 raise TypeError("Backend tools/list result must contain a tools array.")
-            self._tools[backend_name] = tools
-        return self._tools[backend_name]
+            with self._tools_lock:
+                if revision == self._tool_revisions.get(backend_name, 0):
+                    existing = self._tools.setdefault(backend_name, tools)
+                    return existing
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Backend {backend_name} tools/list changed continuously"
+                )
 
     def _tool_catalog(
         self,

@@ -20,16 +20,16 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test tools
-        run: python -m pip install --upgrade pytest pytest-asyncio ruff
+      - name: Install project and test tools
+        run: python -m pip install --upgrade --editable . pytest pytest-asyncio ruff
       - name: Ruff
-        run: python -m ruff check src tests benchmarks
+        run: python -m ruff check src tests benchmarks scripts .github/scripts
       - name: Compile
-        run: python -m compileall -q src tests benchmarks
+        run: python -m compileall -q src tests benchmarks scripts .github/scripts
       - name: Test
         run: python -m pytest -q
 
@@ -43,11 +43,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: ['22', '24']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node-version }}
           registry-url: https://registry.npmjs.org
@@ -63,15 +63,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
-      - name: Install YAML parser
-        run: python -m pip install --upgrade pyyaml
+      - name: Install project and YAML parser
+        run: python -m pip install --upgrade --editable . pyyaml
+      - name: Verify release tooling
+        run: python scripts/release_selftest.py
       - name: Reproduce benchmark
         run: python -m benchmarks.run --manifest benchmarks/fixtures/manifest.json --output .tgl/benchmark-v0.2.0.json
       - name: Compare canonical result

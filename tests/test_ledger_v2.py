@@ -578,9 +578,10 @@ def test_windows_security_policy_covers_database_and_sidecar_paths(tmp_path, mon
     path = tmp_path / "ledger.sqlite"
     secured: list[Path] = []
 
-    def fake_secure(candidate: Path) -> None:
+    def fake_secure(candidate: Path, *, create: bool = True) -> None:
         secured.append(candidate)
-        candidate.touch(exist_ok=True)
+        if create:
+            candidate.touch(exist_ok=True)
 
     monkeypatch.setattr(ledger_module, "_ensure_windows_private_file", fake_secure)
 
@@ -767,16 +768,17 @@ def test_windows_reparse_parent_component_is_rejected_before_open(tmp_path, monk
     assert not any(name == "create" for name, _ in events)
 
 
-def test_every_connect_secures_database_and_sidecars_before_sqlite_open(
+def test_every_connect_does_not_create_or_secure_sidecars_before_sqlite_open(
     tmp_path, monkeypatch
 ):
     path = tmp_path / "ledger.sqlite"
     events: list[tuple[str, Path | None]] = []
     real_connect = sqlite3.connect
 
-    def secure(candidate: Path) -> None:
+    def secure(candidate: Path, *, create: bool = True) -> None:
         events.append(("secure", candidate))
-        candidate.touch(exist_ok=True)
+        if create:
+            candidate.touch(exist_ok=True)
 
     def connect(*args, **kwargs):
         events.append(("connect", None))
@@ -795,9 +797,12 @@ def test_every_connect_secures_database_and_sidecars_before_sqlite_open(
     with ledger._connect():
         pass
 
-    expected = list(ledger._storage_paths())
-    assert events[:4] == [("secure", candidate) for candidate in expected]
-    assert events[4] == ("connect", None)
+    assert events[0] == ("secure", path)
+    assert events[1] == ("connect", None)
+    assert not any(
+        event == "secure" and candidate != path
+        for event, candidate in events[:2]
+    )
 
 
 def test_post_connect_security_failure_closes_connection_and_is_fixed(

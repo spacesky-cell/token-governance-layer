@@ -844,6 +844,49 @@ def test_tools_list_changed_invalidates_only_that_backend_catalog(tmp_path):
     assert second_catalog["tools"][0]["description"].endswith("generation=1")
 
 
+def test_list_changed_during_inflight_catalog_request_cannot_restore_stale_cache(tmp_path):
+    class NotificationBeforeReturnBackend:
+        state = BackendState.ACTIVE
+
+        def __init__(self):
+            self.calls = 0
+            self.name = "changing"
+            self.timeout_seconds = 2
+            self.on_notification = None
+
+        def request(self, method, params=None, *, request_id_observer=None):
+            assert method == "tools/list"
+            self.calls += 1
+            generation = self.calls - 1
+            if self.calls == 1:
+                self.on_notification(
+                    self.name,
+                    {"method": "notifications/tools/list_changed"},
+                )
+            return {
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": f"generation={generation}",
+                        "inputSchema": {"type": "object"},
+                    }
+                ]
+            }
+
+    backend = NotificationBeforeReturnBackend()
+    gateway = McpGateway(
+        ContextLedger(tmp_path / "deterministic-list-change.sqlite"),
+        {"changing": backend},
+        request_timeout_seconds=2,
+    )
+
+    tools = gateway._backend_tools("changing")
+
+    assert backend.calls == 2
+    assert tools[0]["description"] == "generation=1"
+    assert gateway._tools["changing"][0]["description"] == "generation=1"
+
+
 def test_shutdown_escalates_from_wait_to_terminate_then_kill():
     calls = []
 

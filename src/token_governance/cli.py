@@ -109,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     db_path = args.db or DEFAULT_DB_PATH
@@ -209,6 +210,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def _print_json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
+
+
+def _configure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
 
 
 def _runtime_config(config_path: str | None, db_path: str | None) -> GovernanceConfig:

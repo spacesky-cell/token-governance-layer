@@ -106,7 +106,7 @@ class LedgerSecurityError(RuntimeError):
         super().__init__("Unable to secure ledger storage")
 
 
-def _ensure_posix_private_file(path: Path) -> None:
+def _ensure_posix_private_file(path: Path, *, create: bool = True) -> None:
     descriptor = None
     try:
         absolute = Path(os.path.abspath(path))
@@ -119,12 +119,17 @@ def _ensure_posix_private_file(path: Path) -> None:
                 continue
             if stat.S_ISLNK(metadata.st_mode):
                 raise LedgerSecurityError()
-        flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+        if create:
+            flags |= os.O_CREAT
         descriptor = os.open(path, flags, 0o600)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise LedgerSecurityError()
         os.fchmod(descriptor, 0o600)
+    except FileNotFoundError:
+        if create:
+            raise LedgerSecurityError()
     except LedgerSecurityError:
         raise
     except OSError as exc:
@@ -198,7 +203,7 @@ def _windows_current_user_sid() -> str:
         kernel32.CloseHandle(token)
 
 
-def _ensure_windows_private_file(path: Path) -> None:
+def _ensure_windows_private_file(path: Path, *, create: bool = True) -> None:
     import ctypes
     from ctypes import wintypes
 
@@ -264,14 +269,17 @@ def _ensure_windows_private_file(path: Path) -> None:
             0x80000000 | 0x40000000 | 0x00040000,
             0x00000001 | 0x00000002 | 0x00000004,
             ctypes.byref(attributes),
-            4,
+            4 if create else 3,
             0x00000080 | 0x00200000,
             None,
         )
         invalid_handle = wintypes.HANDLE(-1).value
         if handle == invalid_handle:
             handle = None
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.get_last_error()
+            if not create and error in (2, 3):
+                return
+            raise ctypes.WinError(error)
 
         class FileAttributeTagInfo(ctypes.Structure):
             _fields_ = (
@@ -371,8 +379,7 @@ class ContextLedger:
             _ensure_windows_private_file if os.name == "nt" else _ensure_posix_private_file
         )
         try:
-            for path in self._storage_paths():
-                secure(path)
+            secure(self.path)
         except LedgerSecurityError:
             raise
         except Exception as exc:
@@ -384,8 +391,7 @@ class ContextLedger:
         )
         try:
             for path in self._storage_paths():
-                if path.exists():
-                    secure(path)
+                secure(path, create=False)
         except LedgerSecurityError:
             raise
         except Exception as exc:
