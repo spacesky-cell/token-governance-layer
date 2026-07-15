@@ -225,7 +225,7 @@ def clean_network_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
         npm_config = run(["npm", "config", "get", "strict-ssl"], env=env, timeout=15)
         if npm_config.returncode == 0 and npm_config.stdout.strip().lower() in {"false", "0", "no", "off"}:
             reasons.add("npm_strict_ssl_disabled")
-        git_config = run(["git", "config", "--get-regexp", r"^http(?:\..*)?\.sslverify$"], env=env, timeout=15)
+        git_config = run(["git", "config", "--get-regexp", r"^http(\..*)?\.sslverify$"], env=env, timeout=15)
         reasons.update(tls_disabled_reasons({}, git_config=git_config.stdout))
     if reasons:
         raise ReleaseError("TLS verification is disabled")

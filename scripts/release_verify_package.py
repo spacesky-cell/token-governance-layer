@@ -56,7 +56,6 @@ SENSITIVE_FILENAMES = {
 
 
 def scan_secret(data: bytes) -> str | None:
-    data = data[:1024 * 1024]
     for name, pattern in SECRET_PATTERNS:
         if pattern.search(data):
             return name

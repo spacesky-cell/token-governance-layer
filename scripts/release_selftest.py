@@ -100,6 +100,12 @@ class PackageSafetyTests(unittest.TestCase):
         self.assertNotIn(secret, finding)
         self.assertIsNone(scan_secret(b"https://github.com/spacesky-cell/token-governance-layer"))
 
+    def test_secret_scan_catches_findings_after_one_megabyte_bound(self) -> None:
+        value = b"owner" + b"@" + b"example.com"
+        finding = scan_secret(b"x" * (1024 * 1024 + 17) + value)
+        self.assertIsNotNone(finding)
+        self.assertNotIn(value.decode(), finding or "")
+
     def test_privacy_scans_paths_emails_and_sensitive_names_without_values(self) -> None:
         values = (
             b"C:" + b"\\Users\\alice\\private.txt",
