@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from token_governance import __version__
+
 from token_governance.mcp_gateway import (
     BackendState,
     McpGateway,
@@ -652,7 +654,7 @@ def test_backend_uses_own_identity_and_interleaved_notification_is_not_response(
     assert recorded[0]["method"] == "initialize"
     assert recorded[0]["params"]["clientInfo"] == {
         "name": "token-governance-mcp-gateway",
-        "version": "0.2.0",
+        "version": __version__,
     }
     assert recorded[0]["params"]["capabilities"] == {}
     assert recorded[1]["method"] == "notifications/initialized"

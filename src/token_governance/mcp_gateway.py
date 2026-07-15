@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .ledger import ContextLedger
 from .tokenizer import estimate_tokens
 
@@ -275,7 +276,7 @@ class StdioMcpBackend:
             self.start()
             result = self.request("initialize", {
                 "protocolVersion": self.PROTOCOL_VERSION,
-                "clientInfo": {"name": "token-governance-mcp-gateway", "version": "0.2.0"},
+                "clientInfo": {"name": "token-governance-mcp-gateway", "version": __version__},
                 "capabilities": {},
             })
             if result.get("protocolVersion") != self.PROTOCOL_VERSION:
@@ -707,7 +708,7 @@ class McpGateway:
         self._state = GatewayState.INITIALIZED
         result: dict[str, Any] = {
             "protocolVersion": "2025-06-18",
-            "serverInfo": {"name": "token-governance-mcp-gateway", "version": "0.2.0"},
+            "serverInfo": {"name": "token-governance-mcp-gateway", "version": __version__},
             "capabilities": {"tools": {}},
         }
         if failures:

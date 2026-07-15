@@ -21,6 +21,7 @@ from release_common import (
     clean_network_env,
     evidence,
     file_sha256,
+    git_head,
     git_is_clean,
     read_version_sources,
 )
@@ -37,13 +38,35 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     ("npm_token", re.compile(rb"\bnpm_[A-Za-z0-9]{20,}\b")),
     ("aws_access_key", re.compile(rb"\bAKIA[0-9A-Z]{16}\b")),
     ("password_assignment", re.compile(rb"(?i)\b(?:password|passwd|secret|api[_-]?key)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{16,}")),
+    ("personal_windows_path", re.compile(rb"(?i)\b[A-Z]:[\\/]Users[\\/]")),
+    ("personal_unix_path", re.compile(rb"(?i)/(?:Users|home)/[A-Za-z0-9._~-]+/")),
+    ("email_address", re.compile(rb"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
 )
+
+SENSITIVE_FILENAMES = {
+    ".env",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "credentials.json",
+    "private.key",
+    "private.pem",
+    "id_rsa",
+}
 
 
 def scan_secret(data: bytes) -> str | None:
+    data = data[:1024 * 1024]
     for name, pattern in SECRET_PATTERNS:
         if pattern.search(data):
             return name
+    return None
+
+
+def scan_member_name(name: str) -> str | None:
+    lowered = PurePosixPath(name).name.lower()
+    if lowered in SENSITIVE_FILENAMES or lowered.startswith(".env"):
+        return "sensitive_filename"
     return None
 
 
@@ -57,6 +80,53 @@ def safe_member_path(name: str) -> Path:
     if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
         raise PackageVerificationError("package member contains traversal")
     return Path(*relative.parts)
+
+
+def inspect_archive(tarball: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    try:
+        with tarfile.open(tarball, mode="r:gz") as archive:
+            members = archive.getmembers()
+            if len(members) > 1000:
+                raise PackageVerificationError("package contains too many members")
+            seen: set[str] = set()
+            total_size = 0
+            for member in members:
+                if member.name == "package":
+                    continue
+                relative = safe_member_path(member.name)
+                key = relative.as_posix()
+                if key in seen:
+                    raise PackageVerificationError("package contains duplicate members")
+                seen.add(key)
+                finding = scan_member_name(member.name)
+                if finding:
+                    raise PackageVerificationError("package contains sensitive filenames")
+                if member.isdir():
+                    continue
+                if not member.isfile() or member.issym() or member.islnk():
+                    raise PackageVerificationError("package contains a non-regular member")
+                if member.size > 10 * 1024 * 1024:
+                    raise PackageVerificationError("package member exceeds the size limit")
+                total_size += member.size
+                if total_size > 50 * 1024 * 1024:
+                    raise PackageVerificationError("package contents exceed the size limit")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise PackageVerificationError("package member could not be read")
+                data = extracted.read()
+                finding = scan_secret(data)
+                if finding:
+                    raise PackageVerificationError("package contains secret-like content")
+                files[key] = data
+    except (OSError, tarfile.TarError) as exc:
+        raise PackageVerificationError("tarball could not be safely inspected") from exc
+    return files
+
+
+def validate_expected_files(actual: set[str], expected: set[str]) -> None:
+    if actual != expected:
+        raise PackageVerificationError("package file set differs from expected allowlist")
 
 
 def _package_files(manifest: dict[str, Any], root: Path) -> set[str]:
@@ -217,42 +287,11 @@ def verify_package(tarball: Path, output: Path, *, root: Path = ROOT) -> int:
     tarball_hash = file_sha256(tarball)
     if tarball.stat().st_size > 50 * 1024 * 1024:
         raise PackageVerificationError("tarball exceeds the verification size limit")
-    try:
-        with tarfile.open(tarball, mode="r:gz") as archive:
-            members = archive.getmembers()
-            if len(members) > 1000:
-                raise PackageVerificationError("package contains too many members")
-            seen: set[str] = set()
-            files: dict[str, bytes] = {}
-            total_size = 0
-            for member in members:
-                if member.name == "package":
-                    continue
-                relative = safe_member_path(member.name)
-                key = relative.as_posix()
-                if key in seen:
-                    raise PackageVerificationError("package contains duplicate members")
-                seen.add(key)
-                if member.isdir():
-                    continue
-                if not member.isfile() or member.issym() or member.islnk():
-                    raise PackageVerificationError("package contains a non-regular member")
-                if member.size > 10 * 1024 * 1024:
-                    raise PackageVerificationError("package member exceeds the size limit")
-                total_size += member.size
-                if total_size > 50 * 1024 * 1024:
-                    raise PackageVerificationError("package contents exceed the size limit")
-                extracted = archive.extractfile(member)
-                if extracted is None:
-                    raise PackageVerificationError("package member could not be read")
-                data = extracted.read()
-                finding = scan_secret(data)
-                if finding:
-                    raise PackageVerificationError("package contains secret-like content")
-                files[key] = data
-                manifest.append({"path": key, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)})
-    except (OSError, tarfile.TarError) as exc:
-        raise PackageVerificationError("tarball could not be safely inspected") from exc
+    files = inspect_archive(tarball)
+    manifest = [
+        {"path": key, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+        for key, data in files.items()
+    ]
     package_data = files.get("package.json")
     if package_data is None:
         raise PackageVerificationError("package.json is missing")
@@ -262,19 +301,28 @@ def verify_package(tarball: Path, output: Path, *, root: Path = ROOT) -> int:
         raise PackageVerificationError("package.json is invalid") from exc
     if not isinstance(package_json, dict) or package_json.get("name") != PACKAGE_NAME or package_json.get("version") != version:
         raise PackageVerificationError("package identity or version drifted")
+    frozen_sha = git_head(root)
+    git_head_ok = package_json.get("gitHead") == frozen_sha
+    checks.append(check("git_head", git_head_ok, "package gitHead matches frozen commit"))
+    try:
+        source_package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PackageVerificationError("source package.json is unavailable") from exc
+    package_without_head = dict(package_json)
+    package_without_head.pop("gitHead", None)
+    checks.append(check("package_json_source", package_without_head == source_package, "package.json matches source apart from gitHead"))
     expected = _package_files(package_json, root)
     actual = set(files)
-    forbidden = {
-        name
-        for name in actual
-        if name.startswith(("tests/", "scripts/", ".git/", ".tgl/", ".github/", ".claude/", "benchmarks/", "docs/evidence/", "docs/tickets/"))
-        or name in {"VERSION", "package-lock.json", ".npmignore", ".gitignore"}
-        or name.endswith((".tgz", ".sqlite", ".jsonl"))
-    }
-    unexpected = actual - expected
-    checks.append(check("package_identity", not forbidden and not unexpected, "package identity and allowlist"))
+    try:
+        validate_expected_files(actual, expected)
+        file_set_ok = True
+    except PackageVerificationError:
+        file_set_ok = False
+    checks.append(check("package_identity", file_set_ok, "package identity and exact allowlist"))
     for name, data in files.items():
         source = root / name
+        if name == "package.json":
+            continue
         if source.is_file() and source.read_bytes() != data:
             raise PackageVerificationError("packed file differs from the frozen source")
     checks.append(check("source_bytes", True, "packed files match source bytes"))
@@ -286,16 +334,9 @@ def verify_package(tarball: Path, output: Path, *, root: Path = ROOT) -> int:
         checks.extend(lifecycle["checks"])
     except (PackageVerificationError, ReleaseError):
         checks.append(check("install_matrix", False, "packed artifact install matrix failed"))
-    sha = "0" * 40
-    try:
-        from release_common import git_head
-
-        sha = git_head(root)
-    except ReleaseError:
-        pass
     result = evidence(
         version,
-        sha,
+        frozen_sha,
         checks,
         artifact_sha256=tarball_hash,
         manifest=sorted(manifest, key=lambda item: item["path"]),

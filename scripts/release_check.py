@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from release_common import (
     check,
     clean_network_env,
     evidence,
+    file_sha256,
     github_get,
     git_head,
     git_is_clean,
@@ -26,6 +28,19 @@ from release_common import (
     validate_sha256,
     validate_version,
 )
+from release_verify_package import PackageVerificationError, inspect_archive, scan_member_name, safe_member_path
+
+PREFLIGHT_EVIDENCE_CHECKS = {
+    "version_sources", "mcp_gateway_version", "release_documents", "tls", "clean_worktree", "local_tag_absent",
+    "remote_tag_absent", "npm_ping", "npm_whoami", "npm_owner", "github_repository_access",
+    "github_feature_push_dry_run", "github_tag_push_dry_run",
+}
+PACKAGE_EVIDENCE_CHECKS = {
+    "git_head", "package_json_source", "package_identity", "source_bytes", "clean_worktree",
+    "artifact_name", "secret_scan", "global_help", "init", "persistent_install",
+    "doctor_integration", "doctor_read_only", "uninstall", "reinstall", "doctor_after_reinstall",
+    "npx_help", "npx_persistent_rejected", "npx_rejection_read_only",
+}
 
 
 def _npm_auth_checks(env: dict[str, str]) -> list[dict[str, Any]]:
@@ -82,24 +97,74 @@ def _tag_absent(version: str, root: Path) -> list[dict[str, Any]]:
     ]
 
 
-def _publish_evidence_checks(version: str, sha: str, root: Path) -> list[dict[str, Any]]:
+def validate_publish_evidence(root: Path, version: str, sha: str) -> str:
     evidence_dir = root / ".tgl" / "release" / f"v{version}"
-    checks: list[dict[str, Any]] = []
-    try:
-        preflight = load_evidence(evidence_dir / "preflight.json")
-        package = load_evidence(evidence_dir / "package.json")
-        checks.append(check("preflight_evidence", preflight.get("ok") is True and preflight.get("version") == version and preflight.get("git_sha") == sha, "preflight evidence matches current commit"))
-        artifact_hash = package.get("artifact_sha256")
-        checks.append(check("package_evidence", package.get("ok") is True and package.get("version") == version and package.get("git_sha") == sha and isinstance(artifact_hash, str), "package evidence matches current commit"))
+    artifact = evidence_dir / f"{PACKAGE_NAME}-{version}.tgz"
+    if not artifact.is_file():
+        raise ReleaseError("canonical release artifact is unavailable")
+    preflight = load_evidence(evidence_dir / "preflight.json")
+    package = load_evidence(evidence_dir / "package.json")
+
+    def strict(value: dict[str, Any], expected: set[str], label: str) -> None:
+        if value.get("schema_version") != 1 or value.get("ok") is not True or value.get("version") != version or value.get("git_sha") != sha:
+            raise ReleaseError(f"{label} evidence does not match the frozen release")
+        checks = value.get("checks")
+        if not isinstance(checks, list) or not checks:
+            raise ReleaseError(f"{label} evidence checks are malformed")
+        names = [item.get("name") for item in checks if isinstance(item, dict)]
+        if len(names) != len(checks) or any(not isinstance(name, str) for name in names) or len(set(names)) != len(names):
+            raise ReleaseError(f"{label} evidence checks are malformed")
+        if not expected.issubset(set(names)) or any(item.get("ok") is not True for item in checks):
+            raise ReleaseError(f"{label} evidence checks are incomplete")
+
+    strict(preflight, PREFLIGHT_EVIDENCE_CHECKS, "preflight")
+    strict(package, PACKAGE_EVIDENCE_CHECKS, "package")
+    manifest = package.get("manifest")
+    if not isinstance(manifest, list) or not manifest:
+        raise ReleaseError("package evidence manifest is malformed")
+    records: dict[str, tuple[int, str]] = {}
+    for item in manifest:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            raise ReleaseError("package evidence manifest is malformed")
+        path = item["path"]
+        if not isinstance(path, str) or path in records or scan_member_name("package/" + path):
+            raise ReleaseError("package evidence manifest contains an unsafe path")
         try:
-            hash_ok = isinstance(artifact_hash, str) and validate_sha256(artifact_hash) == artifact_hash
-        except ValueError:
-            hash_ok = False
-        checks.append(check("artifact_hash", hash_ok, "recorded artifact SHA-256 is valid"))
+            safe_member_path("package/" + path)
+            digest = validate_sha256(item["sha256"])
+        except (ValueError, PackageVerificationError):
+            raise ReleaseError("package evidence manifest contains an unsafe record")
+        if not isinstance(item["size"], int) or item["size"] < 0:
+            raise ReleaseError("package evidence manifest contains an unsafe record")
+        records[path] = (item["size"], digest)
+    actual = inspect_archive(artifact)
+    actual_records = {path: (len(data), hashlib.sha256(data).hexdigest()) for path, data in actual.items()}
+    if records != actual_records:
+        raise ReleaseError("package evidence manifest does not match the canonical artifact")
+    artifact_hash = file_sha256(artifact)
+    if package.get("artifact_sha256") != artifact_hash:
+        raise ReleaseError("package evidence artifact hash does not match the canonical artifact")
+    return artifact_hash
+
+
+def _publish_evidence_checks(version: str, sha: str, root: Path) -> tuple[list[dict[str, Any]], str]:
+    try:
+        artifact_hash = validate_publish_evidence(root, version, sha)
+        checks = [
+            check("preflight_evidence", True, "preflight evidence matches current commit"),
+            check("package_evidence", True, "package evidence matches current commit"),
+            check("artifact_hash", True, "canonical artifact SHA-256 matches package evidence"),
+            check("artifact_manifest", True, "canonical artifact manifest matches package evidence"),
+        ]
     except ReleaseError:
-        checks.append(check("preflight_evidence", False, "required preflight/package evidence is unavailable"))
-        checks.append(check("package_evidence", False, "required preflight/package evidence is unavailable"))
-    return checks
+        artifact_hash = "0" * 64
+        checks = [
+            check("preflight_evidence", False, "required release evidence is invalid"),
+            check("package_evidence", False, "required release evidence is invalid"),
+            check("artifact_hash", False, "canonical artifact is unavailable or drifted"),
+            check("artifact_manifest", False, "canonical artifact manifest is unavailable or drifted"),
+        ]
+    return checks, artifact_hash
 
 
 def run_check(version: str, phase: str, output: Path, *, root: Path = ROOT) -> int:
@@ -115,14 +180,24 @@ def run_check(version: str, phase: str, output: Path, *, root: Path = ROOT) -> i
         checks.append(check("version_sources", set(versions.values()) == {version}, "all public version sources agree"))
     except ReleaseError:
         checks.append(check("version_sources", False, "version sources are unavailable or ambiguous"))
+    try:
+        gateway_source = (root / "src" / "token_governance" / "mcp_gateway.py").read_text(encoding="utf-8")
+        gateway_ok = gateway_source.count("from . import __version__") == 1 and gateway_source.count('"version": __version__') == 2
+    except (OSError, UnicodeError):
+        gateway_ok = False
+    checks.append(check("mcp_gateway_version", gateway_ok, "MCP Gateway derives both versions from package runtime"))
     checks.append(check("release_documents", release_documents_match(version, root), "CHANGELOG and release notes match target"))
-    tls_ok = os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED") != "0"
+    try:
+        network_env = clean_network_env()
+        tls_ok = True
+    except ReleaseError:
+        network_env = None
+        tls_ok = False
     checks.append(check("tls", tls_ok, "TLS verification enabled"))
     checks.append(check("clean_worktree", git_is_clean(root), "worktree is clean"))
     checks.extend(_tag_absent(version, root))
     if tls_ok:
-        env = clean_network_env()
-        checks.extend(_npm_auth_checks(env))
+        checks.extend(_npm_auth_checks(network_env or {}))
         checks.extend(_github_auth_checks(root, git_output("branch", "--show-current", root=root), version))
     else:
         checks.extend(
@@ -136,8 +211,16 @@ def run_check(version: str, phase: str, output: Path, *, root: Path = ROOT) -> i
             ]
         )
     if phase == "publish":
-        checks.extend(_publish_evidence_checks(version, sha, root))
-    result = evidence(version, sha, checks)
+        evidence_checks, artifact_hash = _publish_evidence_checks(version, sha, root)
+        checks.extend(evidence_checks)
+    else:
+        artifact_hash = None
+    result = evidence(
+        version,
+        sha,
+        checks,
+        **({"artifact_sha256": artifact_hash} if phase == "publish" else {}),
+    )
     atomic_write_json(output, result)
     return 0 if result["ok"] else 1
 

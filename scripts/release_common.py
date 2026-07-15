@@ -168,8 +168,29 @@ def release_documents_match(version: str, root: Path = ROOT) -> bool:
 
 
 def tls_enabled(env: Mapping[str, str] | None = None) -> bool:
-    environment = os.environ if env is None else env
-    return environment.get("NODE_TLS_REJECT_UNAUTHORIZED") != "0"
+    return not tls_disabled_reasons(dict(os.environ if env is None else env))
+
+
+def tls_disabled_reasons(
+    env: Mapping[str, str],
+    *,
+    npm_config: str = "",
+    git_config: str = "",
+) -> set[str]:
+    """Return fixed finding codes for every known TLS-verification disable path."""
+    reasons: set[str] = set()
+    if env.get("NODE_TLS_REJECT_UNAUTHORIZED") == "0":
+        reasons.add("node_tls_disabled")
+    false_values = {"", "0", "false", "no", "off"}
+    if env.get("GIT_SSL_NO_VERIFY", "").strip().lower() not in false_values:
+        reasons.add("git_ssl_disabled")
+    if env.get("NPM_CONFIG_STRICT_SSL", "").strip().lower() in {"false", "0", "no", "off"}:
+        reasons.add("npm_strict_ssl_disabled")
+    if re.search(r"(?im)^\s*strict-ssl\s*=\s*(?:false|0|no|off)\s*(?:#.*)?$", npm_config):
+        reasons.add("npm_strict_ssl_disabled")
+    if re.search(r"(?im)^\s*(?:http(?:\.[^\s=]+)?\.sslverify|http\.sslverify)\s*[=\s]+(?:false|0|no|off)\s*$", git_config):
+        reasons.add("git_ssl_disabled")
+    return reasons
 
 
 def check(name: str, ok: bool, detail: str) -> dict[str, Any]:
@@ -199,9 +220,19 @@ def load_evidence(path: Path) -> dict[str, Any]:
 
 def clean_network_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base is None else base)
-    if not tls_enabled(env):
+    reasons = tls_disabled_reasons(env)
+    if not reasons:
+        npm_config = run(["npm", "config", "get", "strict-ssl"], env=env, timeout=15)
+        if npm_config.returncode == 0 and npm_config.stdout.strip().lower() in {"false", "0", "no", "off"}:
+            reasons.add("npm_strict_ssl_disabled")
+        git_config = run(["git", "config", "--get-regexp", r"^http(?:\..*)?\.sslverify$"], env=env, timeout=15)
+        reasons.update(tls_disabled_reasons({}, git_config=git_config.stdout))
+    if reasons:
         raise ReleaseError("TLS verification is disabled")
     env.pop("NODE_TLS_REJECT_UNAUTHORIZED", None)
+    env.pop("GIT_SSL_NO_VERIFY", None)
+    env["GIT_SSL_NO_VERIFY"] = "0"
+    env["NPM_CONFIG_STRICT_SSL"] = "true"
     return env
 
 

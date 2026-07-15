@@ -39,6 +39,14 @@ REQUIRED_TOPICS = {
 }
 
 
+def _append_failures_once(checks: list[dict[str, Any]], names: tuple[str, ...], detail: str) -> None:
+    existing = {item.get("name") for item in checks}
+    for name in names:
+        if name not in existing:
+            checks.append(check(name, False, detail))
+            existing.add(name)
+
+
 def _download(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "token-governance-layer-release-verifier"})
     try:
@@ -99,7 +107,11 @@ def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: 
     current = git_head(root)
     checks.append(check("local_head", current == expected_sha, "local commit matches frozen release SHA"))
     checks.append(check("clean_worktree", git_is_clean(root), "local worktree is clean"))
-    tls_ok = os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED") != "0"
+    try:
+        clean_network_env()
+        tls_ok = True
+    except ReleaseError:
+        tls_ok = False
     checks.append(check("tls", tls_ok, "TLS verification enabled"))
     if not tls_ok:
         checks.extend(
@@ -133,13 +145,10 @@ def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: 
         release = github_get(f"/repos/{REPOSITORY}/releases/tags/v{version}", root=root)
         checks.append(check("github_release", isinstance(release, dict) and release.get("tag_name") == f"v{version}" and release.get("draft") is False and release.get("prerelease") is False, "published non-draft GitHub Release exists"))
     except ReleaseError:
-        checks.extend(
-            [
-                check("github_topics", False, "GitHub remote verification failed"),
-                check("github_main_ref", False, "GitHub remote verification failed"),
-                check("github_tag_ref", False, "GitHub remote verification failed"),
-                check("github_release", False, "GitHub remote verification failed"),
-            ]
+        _append_failures_once(
+            checks,
+            ("github_topics", "github_main_ref", "github_tag_ref", "github_release"),
+            "GitHub remote verification failed",
         )
     npm_meta: dict[str, Any] = {}
     try:
@@ -164,15 +173,10 @@ def verify_remote(version: str, expected_sha: str, tarball_sha256: str, output: 
         checks.append(check("npm_latest", isinstance(latest_value, dict) and latest_value.get("latest") == version, "npm latest dist-tag matches release"))
         checks.append(check("npm_registry_install", _registry_install(version, root), "clean registry install and help smoke"))
     except (ReleaseError, json.JSONDecodeError):
-        checks.extend(
-            [
-                check("npm_version", False, "npm remote verification failed"),
-                check("npm_git_head", False, "npm remote verification failed"),
-                check("npm_integrity", False, "npm remote verification failed"),
-                check("npm_tarball_hash", False, "npm remote verification failed"),
-                check("npm_latest", False, "npm remote verification failed"),
-                check("npm_registry_install", False, "npm remote verification failed"),
-            ]
+        _append_failures_once(
+            checks,
+            ("npm_version", "npm_git_head", "npm_integrity", "npm_tarball_hash", "npm_latest", "npm_registry_install"),
+            "npm remote verification failed",
         )
     result = evidence(version, expected_sha, checks, artifact_sha256=tarball_sha256)
     atomic_write_json(output, result)
