@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -47,6 +49,7 @@ def test_manifest_contains_required_case_matrix():
 def test_canonical_result_validates_and_has_protected_evidence():
     from benchmarks.run import validate_result
 
+    assert b"\r" not in RESULT.read_bytes()
     data = json.loads(RESULT.read_text(encoding="utf-8"))
     assert validate_result(data) == []
     assert data["label"] == "estimated_candidate_microbenchmark"
@@ -60,6 +63,20 @@ def test_canonical_result_validates_and_has_protected_evidence():
         assert case["action"] == "passthrough"
         assert case["reason_code"] == "secret_detected"
         assert case["receipt_created"] is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX system temp symlinks")
+def test_benchmark_resolves_trusted_system_temp_symlink(tmp_path, monkeypatch):
+    actual_temp = tmp_path / "actual-temp"
+    actual_temp.mkdir()
+    linked_temp = tmp_path / "linked-temp"
+    linked_temp.symlink_to(actual_temp, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(linked_temp))
+    from benchmarks.run import run_manifest
+
+    result = run_manifest(json.loads(MANIFEST.read_text(encoding="utf-8")))
+
+    assert result["aggregate"]["cases"] == 14
 
 
 def test_canonical_command_is_byte_stable(tmp_path):

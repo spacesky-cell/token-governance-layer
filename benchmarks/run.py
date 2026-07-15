@@ -96,7 +96,11 @@ def _evidence(case: dict[str, Any], content: str) -> list[dict[str, str]]:
 
 def run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="tgl-benchmark-") as temp_dir:
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    with tempfile.TemporaryDirectory(
+        prefix="tgl-benchmark-",
+        dir=temp_root,
+    ) as temp_dir:
         ledger = ContextLedger(Path(temp_dir) / "ledger.sqlite")
         engine = create_governance_engine(ledger, config=default_governance_config(ledger.path))
         for case in manifest["cases"]:
